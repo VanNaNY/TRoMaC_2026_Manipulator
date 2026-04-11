@@ -1,0 +1,19 @@
+# MoveIt uses this configuration for controller management
+
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - manipulator_controller
+
+  manipulator_controller:
+    type: FollowJointTrajectory
+    joints:
+      - yaw-1-joint
+      - pitch-1-joint
+      - pitch-2-joint
+      - roll-1-joint
+      - pitch-3-joint
+      - roll-2-joint
+    action_ns: follow_joint_trajectory
+    default: true

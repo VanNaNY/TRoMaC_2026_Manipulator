@@ -1,0 +1,25 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: manipulator
+    relative_path: urdf/manipulator.urdf
+  srdf:
+    relative_path: config/机械臂-总装-新-4.SLDASM.srdf
+  package_settings:
+    author_name: VanNaNY
+    author_email: 3069823637@qq.com
+    generated_timestamp: 1775487884
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity

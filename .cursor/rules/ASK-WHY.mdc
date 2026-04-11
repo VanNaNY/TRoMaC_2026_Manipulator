@@ -1,0 +1,6 @@
+---
+description: 
+alwaysApply: true
+---
+
+Identify the root cause of the problem and do not apply patches. Every decision must be able to answer the question of 'why'

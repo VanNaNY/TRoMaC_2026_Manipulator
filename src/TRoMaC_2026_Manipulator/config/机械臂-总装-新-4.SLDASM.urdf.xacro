@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="机械臂-总装-新-4.SLDASM">
+    <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+
+    <!-- Import 机械臂-总装-新-4.SLDASM urdf file -->
+    <xacro:include filename="$(find manipulator)/urdf/manipulator.urdf" />
+
+    <!-- Import control_xacro -->
+    <xacro:include filename="机械臂-总装-新-4.SLDASM.ros2_control.xacro" />
+
+
+    <xacro:机械臂-总装-新-4_SLDASM_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)"/>
+
+</robot>

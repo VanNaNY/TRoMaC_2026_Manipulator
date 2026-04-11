@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="机械臂-总装-新-4.SLDASM">
+  <link
+    name="base_footprint" />
+  <joint
+    name="base_footprint_joint"
+    type="fixed">
+    <!-- SolidWorks export is Y-up; rotate into ROS Z-up -->
+    <origin
+      xyz="0 0 0"
+      rpy="1.5708 0 0" />
+    <parent
+      link="base_footprint" />
+    <child
+      link="base_link" />
+  </joint>
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="0.000540411798867935 0.0124322307193705 -1.54672344376827E-10"
+        rpy="0 0 0" />
+      <mass
+        value="0.0556763627352784" />
+      <inertia
+        ixx="1.98044410676665E-05"
+        ixy="7.33360123171482E-07"
+        ixz="-2.69004593077326E-13"
+        iyy="3.66435900314757E-05"
+        iyz="-6.1612943567905E-14"
+        izz="1.97725629523263E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="yaw-1_Link">
+    <inertial>
+      <origin
+        xyz="0.00173606714305241 0.0393975093525026 0.0499301586315414"
+        rpy="0 0 0" />
+      <mass
+        value="0.699847767811444" />
+      <inertia
+        ixx="0.00121499609569452"
+        ixy="7.87844038450496E-06"
+        ixz="-6.99451355347619E-06"
+        iyy="0.00139336345297532"
+        iyz="-0.000150064612974483"
+        izz="0.000922952928569466" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/yaw-1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.850980392156863 0.850980392156863 0.850980392156863 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/yaw-1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="yaw-1-joint"
+    type="continuous">
+    <origin
+      xyz="0.0014331 0.032969 0.0033461"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="yaw-1_Link" />
+    <axis
+      xyz="0.043428 0.99906 0" />
+  </joint>
+  <link
+    name="pitch-1_Link">
+    <inertial>
+      <origin
+        xyz="-0.075061227547583 0.00297413415250369 -0.0211883677846918"
+        rpy="0 0 0" />
+      <mass
+        value="0.702950372217593" />
+      <inertia
+        ixx="0.000311718547661158"
+        ixy="1.65788487228146E-05"
+        ixz="-2.68528488471669E-06"
+        iyy="0.000702290027009602"
+        iyz="1.5448350468188E-07"
+        izz="0.00082307246401501" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/pitch-1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.796078431372549 0.823529411764706 0.937254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/pitch-1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="pitch-1-joint"
+    type="revolute">
+    <origin
+      xyz="0.0027359 0.062941 0.044154"
+      rpy="0 0 0" />
+    <parent
+      link="yaw-1_Link" />
+    <child
+      link="pitch-1_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-3.1416"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="pitch-2_Link">
+    <inertial>
+      <origin
+        xyz="-0.0423029588393058 0.0680884537332184 0.0404035253436538"
+        rpy="0 0 0" />
+      <mass
+        value="0.361976575679553" />
+      <inertia
+        ixx="0.000421507687599061"
+        ixy="8.80901957191252E-05"
+        ixz="1.40484190064578E-07"
+        iyy="0.000369982696996701"
+        iyz="-8.17083126654741E-08"
+        izz="0.000391406191715732" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/pitch-2_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.850980392156863 0.850980392156863 0.850980392156863 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/pitch-2_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="pitch-2-joint"
+    type="revolute">
+    <origin
+      xyz="-0.17827 0.0077492 0.015"
+      rpy="3.1416 0 3.1416" />
+    <parent
+      link="pitch-1_Link" />
+    <child
+      link="pitch-2_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-3.707"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="roll-1_Link">
+    <inertial>
+      <origin
+        xyz="0.0170334623906306 0.0235148862860126 -0.00124075485811816"
+        rpy="0 0 0" />
+      <mass
+        value="0.273407993282162" />
+      <inertia
+        ixx="0.00021313444127893"
+        ixy="-5.59770065455228E-06"
+        ixz="-9.26700682939909E-06"
+        iyy="0.000210602595084302"
+        iyz="-3.4243027159068E-06"
+        izz="0.000165621782010026" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/roll-1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.850980392156863 0.850980392156863 0.850980392156863 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/roll-1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="roll-1-joint"
+    type="continuous">
+    <origin
+      xyz="-0.1017 0.13297 0.039865"
+      rpy="3.1416 0 3.1416" />
+    <parent
+      link="pitch-2_Link" />
+    <child
+      link="roll-1_Link" />
+    <axis
+      xyz="-0.60474 -0.79642 0" />
+  </joint>
+  <link
+    name="pitch-3_Link">
+    <inertial>
+      <origin
+        xyz="0.0226629336866137 -0.0528291070566355 -0.0496470538732838"
+        rpy="0 0 0" />
+      <mass
+        value="0.221532760510514" />
+      <inertia
+        ixx="0.000474542203785055"
+        ixy="7.70501957770588E-05"
+        ixz="-1.09346729584093E-05"
+        iyy="0.000341602312818495"
+        iyz="-1.32828085315328E-06"
+        izz="0.000265597817983414" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/pitch-3_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.850980392156863 0.850980392156863 0.850980392156863 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/pitch-3_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="pitch-3-joint"
+    type="revolute">
+    <origin
+      xyz="0.029894 0.033804 0.044688"
+      rpy="0 0 0" />
+    <parent
+      link="roll-1_Link" />
+    <child
+      link="pitch-3_Link" />
+    <axis
+      xyz="0.071515 -0.054303 0.99596" />
+    <limit
+      lower="0"
+      upper="4.0942"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="roll-2_Link">
+    <inertial>
+      <origin
+        xyz="0.0693310269582374 -0.0382718004395871 0.0133577336343076"
+        rpy="0 0 0" />
+      <mass
+        value="0.272871992345367" />
+      <inertia
+        ixx="0.000155562094949162"
+        ixy="4.8765286857318E-06"
+        ixz="-9.85397284558914E-06"
+        iyy="0.000155711830612948"
+        iyz="7.40161681384119E-06"
+        izz="4.53642436082961E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/roll-2_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://manipulator/meshes/roll-2_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="roll-2-joint"
+    type="revolute">
+    <origin
+      xyz="0.040807 -0.094531 -0.052226"
+      rpy="0 0 0" />
+    <parent
+      link="pitch-3_Link" />
+    <child
+      link="roll-2_Link" />
+    <axis
+      xyz="0.4242 -0.90206 -0.079643" />
+    <limit
+      lower="-2.393"
+      upper="2.393"
+      effort="0"
+      velocity="0" />
+  </joint>
+</robot>

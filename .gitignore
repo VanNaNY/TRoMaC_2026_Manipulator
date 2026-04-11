@@ -1,0 +1,23 @@
+# colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+
+# CMake / tooling
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

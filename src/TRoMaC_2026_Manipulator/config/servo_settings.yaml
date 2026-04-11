@@ -1,0 +1,53 @@
+use_gazebo: false # 告诉servo不在gazebo中运行。因为Gazebo有一套自己的典型话题/时钟假设，并非系统时间，
+                  # 如果要用需自行订阅/clock话题
+
+## Incoming command properties
+command_in_type: "unitless" # 笛卡尔速度指令，单位并非m/s或rad/s，而是[-1:1]方向与相对强度。
+scale:
+  linear: 0.20 # 线速度
+  rotational: 0.60 # 角速度
+  joint: 0.50 # 关节速度(也就是JointJog的速度缩放)
+
+## Outgoing command properties
+publish_period: 0.01 # 发布关节轨迹周期，单位秒。
+low_latency_mode: true # 一有有效指令就尽快更新输出。
+command_out_type: trajectory_msgs/JointTrajectory # Servo 下游对接 JointTrajectory控制器。
+publish_joint_positions: true # 发布的轨迹点需不需要带上关节角
+publish_joint_velocities: true # 发布的轨迹点需不需要带上关节角速度
+publish_joint_accelerations: false # 发布的轨迹点需不需要带上关节角加速度
+
+## Smoothing
+smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin" # 平滑滤波
+
+## Planning scene ownership
+is_primary_planning_scene_monitor: false # 是否是主规划场景监控器。
+#规划场景包括机器人各连杆姿态、禁止碰的体素/物体、附加的夹爪物体、有时还有 octomap 等。碰撞检测、奇异/限位之外的安全逻辑很多都依赖这份场景。
+
+## MoveIt group and frames
+move_group_name: manipulator
+planning_frame: base_link
+ee_frame_name: roll-2_Link
+robot_link_command_frame: base_link
+
+## Stopping behavior
+incoming_command_timeout: 0.10
+num_outgoing_halt_msgs_to_publish: 4
+
+## Singularity and joint limit handling
+lower_singularity_threshold: 100.0
+hard_stop_singularity_threshold: 200.0
+leaving_singularity_threshold_multiplier: 2.0
+joint_limit_margin: 0.10
+
+## Topics
+cartesian_command_in_topic: ~/delta_twist_cmds
+joint_command_in_topic: ~/delta_joint_cmds
+joint_topic: /joint_states
+status_topic: ~/status
+command_out_topic: /manipulator_controller/joint_trajectory
+
+## Collision checking
+check_collisions: true
+collision_check_rate: 10.0
+self_collision_proximity_threshold: 0.01
+scene_collision_proximity_threshold: 0.02
