@@ -265,9 +265,7 @@ namespace TRoMaC
         TXunion.VisionFrameTX.Joint_6 = data.Joint_6;
 
 		auto write_stauts = write(serial_id, &TXunion.u8arr[0], SEND_DATA_NUM);
-
         tcflush(serial_id, TCOFLUSH);
-        
 		if (write_stauts != SEND_DATA_NUM) 
         { 
 			std::cout << "send error! the length of data is: " << write_stauts << std::endl;

@@ -24,3 +24,7 @@ manipulator_controller:
     state_interfaces:
       - position
       - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+    constraints:
+      stopped_velocity_tolerance: 0.0
+      goal_time: 0.0
