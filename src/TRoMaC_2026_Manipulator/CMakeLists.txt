@@ -14,7 +14,7 @@ ament_target_dependencies(servo_keyboard_input
   rclcpp geometry_msgs control_msgs std_srvs)
 
 add_executable(serial_comm_node src/serial_comm_node.cpp src/Serial.cpp)
-ament_target_dependencies(serial_comm_node rclcpp std_msgs geometry_msgs std_srvs sensor_msgs)
+ament_target_dependencies(serial_comm_node rclcpp std_msgs geometry_msgs control_msgs std_srvs sensor_msgs)
 
 install(TARGETS servo_keyboard_input serial_comm_node
   DESTINATION lib/${PROJECT_NAME})

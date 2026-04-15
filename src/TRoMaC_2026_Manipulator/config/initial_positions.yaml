@@ -2,8 +2,8 @@
 
 initial_positions:
   yaw-1-joint: 0
-  pitch-1-joint: 0 #-1.0
-  pitch-2-joint: 0 #-0.5
+  pitch-1-joint: -1.0
+  pitch-2-joint: -0.5
   roll-1-joint: 0
-  pitch-3-joint: 0 #0.5
+  pitch-3-joint: 0.5
   roll-2-joint: 0

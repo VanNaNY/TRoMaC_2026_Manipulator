@@ -35,8 +35,8 @@ incoming_command_timeout: 1.00
 num_outgoing_halt_msgs_to_publish: 4
 
 ## Singularity and joint limit handling
-lower_singularity_threshold: 500.0
-hard_stop_singularity_threshold: 2000.0
+lower_singularity_threshold: 1000.0
+hard_stop_singularity_threshold: 5000.0
 leaving_singularity_threshold_multiplier: 2.0
 joint_limit_margin: 0.01 # 关节限位余量，单位rad
 

@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <control_msgs/msg/joint_jog.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -17,6 +18,15 @@
 #include <sys/select.h>
 
 static constexpr char START_SERVO_SERVICE[] = "/servo_node/start_servo";
+
+// 控制模式枚举
+enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 = 2 };
+
+// 前三轴/后三轴关节名
+static const std::vector<std::string> JOINT_GROUP_1_NAMES = {
+    "yaw-1-joint", "pitch-1-joint", "pitch-2-joint"};
+static const std::vector<std::string> JOINT_GROUP_2_NAMES = {
+    "roll-1-joint", "pitch-3-joint", "roll-2-joint"};
 
 // Apply deadband then scale a raw joystick value to [-max_output, +max_output].
 // Values within [-deadzone, +deadzone] map to exactly 0.
@@ -144,6 +154,10 @@ public:
       servo_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
           "/servo_node/delta_twist_cmds", rclcpp::SystemDefaultsQoS());
 
+      // 关节模式 JointJog publisher
+      joint_jog_pub_ = create_publisher<control_msgs::msg::JointJog>(
+          "/servo_node/delta_joint_cmds", rclcpp::SystemDefaultsQoS());
+
       // 不再使用定时器发布——改为在 readLoop 中收到串口数据后直接发布 twist，
       // 和键盘节点一样的事件驱动模式。
       std::thread([this]() { this->callStartServo(); }).detach();
@@ -256,18 +270,64 @@ private:
               rx_copy.Button,
               rx_copy.EndFrame);
 
-          // 收到一帧串口数据就立即发布 twist (事件驱动，和键盘节点模式一致)
+          // 根据按键切换控制模式（电平式：按下瞬间触发，松开回到其他值）
           if (enable_servo_control_)
           {
-            geometry_msgs::msg::TwistStamped twist;
-            twist.header.stamp    = now();
-            twist.header.frame_id = planning_frame_;
-            twist.twist.linear.x  = applyJoyAxis(rx_copy.Arm_Pos_x,    joy_deadzone_xyz_,    1000, joy_max_linear_);
-            twist.twist.linear.y  = applyJoyAxis(rx_copy.Arm_Pos_y,    joy_deadzone_xyz_,    1000, joy_max_linear_);
-            twist.twist.linear.z  = applyJoyAxis(rx_copy.Arm_Pos_z,    joy_deadzone_xyz_,    1000, joy_max_linear_);
-            twist.twist.angular.x = applyJoyAxis(rx_copy.Arm_Pos_Roll, joy_deadzone_angular_, 100, joy_max_angular_);
-            twist.twist.angular.y = applyJoyAxis(rx_copy.Arm_Pos_Pitch,joy_deadzone_angular_, 100, joy_max_angular_);
-            servo_pub_->publish(twist);
+            // 更新控制模式
+            ControlMode new_mode = ControlMode::CARTESIAN;
+            if (rx_copy.Button == 13)
+              new_mode = ControlMode::JOINT_GROUP_1;
+            else if (rx_copy.Button == 11)
+              new_mode = ControlMode::JOINT_GROUP_2;
+
+            ControlMode old_mode = control_mode_.exchange(new_mode);
+            if (old_mode != new_mode)
+            {
+              const char* mode_str =
+                  (new_mode == ControlMode::CARTESIAN)     ? "笛卡尔 Servo" :
+                  (new_mode == ControlMode::JOINT_GROUP_1) ? "关节遥控 (前三轴: yaw-1, pitch-1, pitch-2)" :
+                                                             "关节遥控 (后三轴: roll-1, pitch-3, roll-2)";
+              RCLCPP_INFO(get_logger(), "控制模式切换 → %s", mode_str);
+            }
+
+            if (new_mode == ControlMode::CARTESIAN)
+            {
+              // 笛卡尔模式：发布 TwistStamped
+              geometry_msgs::msg::TwistStamped twist;
+              twist.header.stamp    = now();
+              twist.header.frame_id = planning_frame_;
+              twist.twist.linear.x  = applyJoyAxis(rx_copy.Arm_Pos_x,    joy_deadzone_xyz_,    1000, joy_max_linear_);
+              twist.twist.linear.y  = applyJoyAxis(rx_copy.Arm_Pos_y,    joy_deadzone_xyz_,    1000, joy_max_linear_);
+              twist.twist.linear.z  = applyJoyAxis(rx_copy.Arm_Pos_z,    joy_deadzone_xyz_,    1000, joy_max_linear_);
+              twist.twist.angular.x = applyJoyAxis(rx_copy.Arm_Pos_Roll, joy_deadzone_angular_, 100, joy_max_angular_);
+              twist.twist.angular.y = applyJoyAxis(rx_copy.Arm_Pos_Pitch,joy_deadzone_angular_, 100, joy_max_angular_);
+              servo_pub_->publish(twist);
+            }
+            else
+            {
+              // 关节模式：先发全零 Twist 清除 Servo 内部缓存的笛卡尔指令，
+              // 否则 Servo 会优先执行上一帧残留的 Twist 导致其他关节跟着动
+              geometry_msgs::msg::TwistStamped zero_twist;
+              zero_twist.header.stamp    = now();
+              zero_twist.header.frame_id = planning_frame_;
+              servo_pub_->publish(zero_twist);
+
+              // 发布 JointJog，x/y/z 轴映射到对应的 3 个关节
+              const auto& joint_names = (new_mode == ControlMode::JOINT_GROUP_1)
+                                            ? JOINT_GROUP_1_NAMES
+                                            : JOINT_GROUP_2_NAMES;
+
+              double vel_x = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_y = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_z = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+
+              control_msgs::msg::JointJog jog;
+              jog.header.stamp    = now();
+              jog.header.frame_id = planning_frame_;
+              jog.joint_names     = {joint_names[0], joint_names[1], joint_names[2]};
+              jog.velocities      = {vel_x, vel_y, vel_z};
+              joint_jog_pub_->publish(jog);
+            }
           }
         }
       }
@@ -379,7 +439,9 @@ private:
   bool       joint_tx_ready_{false};
 
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr     servo_pub_;
+  rclcpp::Publisher<control_msgs::msg::JointJog>::SharedPtr         joint_jog_pub_;
   bool                                                               enable_servo_control_{false};
+  std::atomic<ControlMode>                                           control_mode_{ControlMode::CARTESIAN};
 
   // Cached parameters (read once in ctor)
   std::string  planning_frame_;

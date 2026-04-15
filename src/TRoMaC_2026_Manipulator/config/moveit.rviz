@@ -25,6 +25,9 @@ Visualization Manager:
         Scene Alpha: 1
       Scene Robot:
         Robot Alpha: 1
+      Planning Request:
+        Planning Group: manipulator
+        Query Goal State: false
       Value: true
   Global Options:
     Fixed Frame: base_footprint
