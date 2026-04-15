@@ -247,7 +247,7 @@ private:
             count   = rx_count_;
           }
 
-          // 发布到 ROS 话题，字段顺序：x, y, z, pitch, roll, button
+          // 发布到 ROS 话题，字段顺序：x, y, z, pitch, roll, button, real_j1~j6
           std_msgs::msg::Float64MultiArray rx_msg;
           rx_msg.data = {
             static_cast<double>(rx_copy.Arm_Pos_x),
@@ -255,12 +255,19 @@ private:
             static_cast<double>(rx_copy.Arm_Pos_z),
             static_cast<double>(rx_copy.Arm_Pos_Pitch),
             static_cast<double>(rx_copy.Arm_Pos_Roll),
-            static_cast<double>(rx_copy.Button)
+            static_cast<double>(rx_copy.Button),
+            static_cast<double>(rx_copy.Real_Joint_1),
+            static_cast<double>(rx_copy.Real_Joint_2),
+            static_cast<double>(rx_copy.Real_Joint_3),
+            static_cast<double>(rx_copy.Real_Joint_4),
+            static_cast<double>(rx_copy.Real_Joint_5),
+            static_cast<double>(rx_copy.Real_Joint_6)
           };
           recv_pub_->publish(rx_msg);
           RCLCPP_INFO(
               get_logger(),
-              "RX [#%lu] x=%d  y=%d  z=%d  Pitch=%d  Roll=%d  Button=%u  EndFrame=%u",
+              "RX [#%lu] x=%d y=%d z=%d Pitch=%d Roll=%d Button=%u | "
+              "Real_J: %d %d %d %d %d %d",
               count,
               rx_copy.Arm_Pos_x,
               rx_copy.Arm_Pos_y,
@@ -268,7 +275,12 @@ private:
               rx_copy.Arm_Pos_Pitch,
               rx_copy.Arm_Pos_Roll,
               rx_copy.Button,
-              rx_copy.EndFrame);
+              rx_copy.Real_Joint_1,
+              rx_copy.Real_Joint_2,
+              rx_copy.Real_Joint_3,
+              rx_copy.Real_Joint_4,
+              rx_copy.Real_Joint_5,
+              rx_copy.Real_Joint_6);
 
           // 根据按键切换控制模式（电平式：按下瞬间触发，松开回到其他值）
           if (enable_servo_control_)
@@ -292,16 +304,29 @@ private:
 
             if (new_mode == ControlMode::CARTESIAN)
             {
-              // 笛卡尔模式：发布 TwistStamped
+              // 平移走笛卡尔 Servo，Roll/Pitch 直接控制末端关节
+              double roll_vel  = applyJoyAxis(rx_copy.Arm_Pos_Roll,  joy_deadzone_angular_, 100, joy_max_angular_);
+              double pitch_vel = applyJoyAxis(rx_copy.Arm_Pos_Pitch, joy_deadzone_angular_, 100, joy_max_angular_);
+
+              // 1) TwistStamped: 仅平移，angular 全零
               geometry_msgs::msg::TwistStamped twist;
               twist.header.stamp    = now();
               twist.header.frame_id = planning_frame_;
-              twist.twist.linear.x  = applyJoyAxis(rx_copy.Arm_Pos_x,    joy_deadzone_xyz_,    1000, joy_max_linear_);
-              twist.twist.linear.y  = applyJoyAxis(rx_copy.Arm_Pos_y,    joy_deadzone_xyz_,    1000, joy_max_linear_);
-              twist.twist.linear.z  = applyJoyAxis(rx_copy.Arm_Pos_z,    joy_deadzone_xyz_,    1000, joy_max_linear_);
-              twist.twist.angular.x = applyJoyAxis(rx_copy.Arm_Pos_Roll, joy_deadzone_angular_, 100, joy_max_angular_);
-              twist.twist.angular.y = applyJoyAxis(rx_copy.Arm_Pos_Pitch,joy_deadzone_angular_, 100, joy_max_angular_);
+              twist.twist.linear.x  = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              twist.twist.linear.y  = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              twist.twist.linear.z  = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
               servo_pub_->publish(twist);
+
+              // 2) JointJog: Roll → roll-2-joint (末端), Pitch → pitch-3-joint (倒数第二)
+              if (std::abs(roll_vel) > 0.0 || std::abs(pitch_vel) > 0.0)
+              {
+                control_msgs::msg::JointJog jog;
+                jog.header.stamp    = now();
+                jog.header.frame_id = planning_frame_;
+                jog.joint_names     = {"pitch-3-joint", "roll-2-joint"};
+                jog.velocities      = {pitch_vel, roll_vel};
+                joint_jog_pub_->publish(jog);
+              }
             }
             else
             {
@@ -317,9 +342,9 @@ private:
                                             ? JOINT_GROUP_1_NAMES
                                             : JOINT_GROUP_2_NAMES;
 
-              double vel_x = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vel_y = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vel_z = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_x = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_y = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_z = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
 
               control_msgs::msg::JointJog jog;
               jog.header.stamp    = now();
