@@ -282,6 +282,16 @@ private:
               rx_copy.Real_Joint_5,
               rx_copy.Real_Joint_6);
 
+          // DEBUG: 打印 RX payload 原始 hex，排查下位机是否填充了 Real_Joint 字段
+         /* {
+            const auto* p = reinterpret_cast<const uint8_t*>(&rx_copy);
+            char hex[RX_PAYLOAD_SIZE * 3 + 1];
+            for (int i = 0; i < RX_PAYLOAD_SIZE; ++i)
+              snprintf(hex + i * 3, 4, "%02X ", p[i]);
+            hex[RX_PAYLOAD_SIZE * 3] = '\0';
+            RCLCPP_INFO(get_logger(), "RX payload hex: %s", hex);
+          }*/
+
           // 根据按键切换控制模式（电平式：按下瞬间触发，松开回到其他值）
           if (enable_servo_control_)
           {
@@ -429,7 +439,9 @@ private:
     {
       auto it = pos_map.find(joint_names[i]);
       if (it == pos_map.end()) return;  // 本帧不含全部关节，跳过
-      angles[i] = it->second * (180.0 / M_PI);  // rad → deg
+      // ROS 弧度 → 下位机度数：先减去 ROS 零位偏移（即下位机零点对应的 ROS 弧度值），
+      // 得到以下位机零点为基准的弧度差，再转整数度。
+      angles[i] = (it->second - joint_offset_rad_[i]) * (180.0 / M_PI);
     }
 
     {
@@ -448,6 +460,17 @@ private:
 
   std::thread       read_thread_;
   std::atomic<bool> running_{false};
+
+  // 下位机电机零点在 ROS 坐标系下的弧度值 (initial_positions)
+  // 顺序：yaw-1, pitch-1, pitch-2, roll-1, pitch-3, roll-2
+  static constexpr double joint_offset_rad_[6] = {
+    -3.1415,   // yaw-1-joint
+    -3.1416,   // pitch-1-joint
+    -3.7070,   // pitch-2-joint
+     0.0868,   // roll-1-joint
+     0.4750,   // pitch-3-joint
+     0.0        // roll-2-joint
+  };
 
   std::mutex                            rx_mutex_;
   TRoMaC::VisionFrameRX_structTypedef   latest_rx_{};

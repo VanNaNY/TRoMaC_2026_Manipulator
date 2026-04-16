@@ -1,9 +1,9 @@
 # Default initial positions for 机械臂-总装-新-4.SLDASM's ros2_control fake system
 
 initial_positions:
-  yaw-1-joint: 0
-  pitch-1-joint: -1.0
-  pitch-2-joint: -0.5
-  roll-1-joint: 0
-  pitch-3-joint: 0.5
+  yaw-1-joint: -3.1415
+  pitch-1-joint: -3.1416
+  pitch-2-joint: -3.7070
+  roll-1-joint: 0.0868
+  pitch-3-joint: 0.4750
   roll-2-joint: 0
