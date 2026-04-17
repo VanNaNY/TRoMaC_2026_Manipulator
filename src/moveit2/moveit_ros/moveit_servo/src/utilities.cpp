@@ -148,7 +148,7 @@ double velocityScalingFactorForSingularity(const moveit::core::JointModelGroup* 
   // Very close to singularity, so halt.
   else if (ini_condition >= upper_threshold)
   {
-    velocity_scale = 0.02;  // 保留5%最低速度，允许缓慢穿越奇异点
+    velocity_scale = 0.001;  // 保留5%最低速度，允许缓慢穿越奇异点
     status = StatusCode::HALT_FOR_SINGULARITY;
     RCLCPP_WARN_STREAM_THROTTLE(LOGGER, clock, ROS_LOG_THROTTLE_PERIOD, SERVO_STATUS_CODE_MAP.at(status));
   }
