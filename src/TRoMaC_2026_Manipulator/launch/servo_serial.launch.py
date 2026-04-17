@@ -65,17 +65,21 @@ def generate_launch_description():
         executable="serial_comm_node",
         name="serial_comm_node",
         output="screen",
-        parameters=[{
-            "device":                LaunchConfiguration("serial_device"),
-            "baud_rate":             921600,
-            "auto_send":             True,
-            "enable_servo_control":  True,
-            "planning_frame":        "base_link",
-            "joy_deadzone_xyz":      30,
-            "joy_deadzone_angular":  3,
-            "joy_max_linear":        1.0,
-            "joy_max_angular":       1.0,
-        }],
+        parameters=[
+            {
+                "device":                LaunchConfiguration("serial_device"),
+                "baud_rate":             921600,
+                "auto_send":             True,
+                "enable_servo_control":  True,
+                "planning_frame":        "base_link",
+                "joy_deadzone_xyz":      30,
+                "joy_deadzone_angular":  3,
+                "joy_max_linear":        1.0,
+                "joy_max_angular":       1.0,
+            },
+            moveit_config.robot_description,
+            moveit_config.robot_description_semantic,
+        ],
     )
 
     return LaunchDescription([

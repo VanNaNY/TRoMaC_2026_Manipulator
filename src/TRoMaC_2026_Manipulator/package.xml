@@ -23,6 +23,8 @@
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
   <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>moveit_core</depend>
 
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>moveit_ros_move_group</exec_depend>
