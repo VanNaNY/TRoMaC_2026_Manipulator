@@ -27,7 +27,7 @@ is_primary_planning_scene_monitor: false # 是否是主规划场景监控器。
 ## MoveIt group and frames
 move_group_name: manipulator
 planning_frame: base_link
-ee_frame_name: roll-2_Link
+ee_frame_name: roll-1_Link
 robot_link_command_frame: base_link
 
 ## Stopping behavior

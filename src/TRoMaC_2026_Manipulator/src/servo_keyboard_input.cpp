@@ -26,7 +26,7 @@ static const std::string JOINT_TOPIC = "/servo_node/delta_joint_cmds";
 static const std::string START_SERVO_SERVICE = "/servo_node/start_servo";
 
 static const std::string BASE_FRAME_ID = "base_link";
-static const std::string EEF_FRAME_ID = "roll-2_Link";
+static const std::string EEF_FRAME_ID = "roll-1_Link";
 
 static const std::vector<std::string> JOINT_NAMES = {
     "yaw-1-joint", "pitch-1-joint", "pitch-2-joint",

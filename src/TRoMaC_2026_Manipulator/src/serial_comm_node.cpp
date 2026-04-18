@@ -425,7 +425,6 @@ private:
               // 平移走笛卡尔 Servo，Roll/Pitch 直接控制末端关节
               double roll_vel  = applyJoyAxis(rx_copy.Arm_Pos_Roll,  joy_deadzone_angular_, 100, joy_max_angular_);
               double pitch_vel = applyJoyAxis(rx_copy.Arm_Pos_Pitch, joy_deadzone_angular_, 100, joy_max_angular_);
-
               double lx = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
               double ly = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
               double lz = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
@@ -490,7 +489,7 @@ private:
 
                   // 叠加末端 Roll/Pitch 直接控制
                   q_dot[4] += pitch_vel;  // pitch-3-joint
-                  q_dot[5] += roll_vel;   // roll-2-joint
+                  q_dot[3] += roll_vel;   // roll-1-joint
 
                   // 钳位到 [-1, 1]（unitless，Servo 会乘以 scale.joint）
                   for (int i = 0; i < 6; ++i)
@@ -556,13 +555,13 @@ private:
                 twist.twist.linear.z  = lz;
                 servo_pub_->publish(twist);
 
-                // 2) JointJog: Roll → roll-2-joint (末端), Pitch → pitch-3-joint (倒数第二)
+                // 2) JointJog: Roll → roll-1-joint, Pitch → pitch-3-joint
                 if (std::abs(roll_vel) > 0.0 || std::abs(pitch_vel) > 0.0)
                 {
                   control_msgs::msg::JointJog jog;
                   jog.header.stamp    = now();
                   jog.header.frame_id = planning_frame_;
-                  jog.joint_names     = {"pitch-3-joint", "roll-2-joint"};
+                  jog.joint_names     = {"pitch-3-joint", "roll-1-joint"};
                   jog.velocities      = {pitch_vel, roll_vel};
                   joint_jog_pub_->publish(jog);
                 }
