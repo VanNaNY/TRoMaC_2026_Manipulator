@@ -333,7 +333,7 @@
     <axis
       xyz="0.071515 -0.054303 0.99596" />
     <limit
-      lower="0.8066"
+      lower="0.470"
       upper="4.0942"
       effort="0"
       velocity="0" />

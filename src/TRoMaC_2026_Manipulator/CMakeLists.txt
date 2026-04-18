@@ -9,6 +9,7 @@ find_package(std_srvs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(moveit_core REQUIRED)
+find_package(moveit_ros_planning_interface REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_executable(servo_keyboard_input src/servo_keyboard_input.cpp)
@@ -16,7 +17,7 @@ ament_target_dependencies(servo_keyboard_input
   rclcpp geometry_msgs control_msgs std_srvs)
 
 add_executable(serial_comm_node src/serial_comm_node.cpp src/Serial.cpp)
-ament_target_dependencies(serial_comm_node rclcpp std_msgs geometry_msgs control_msgs std_srvs sensor_msgs moveit_core Eigen3)
+ament_target_dependencies(serial_comm_node rclcpp std_msgs geometry_msgs control_msgs std_srvs sensor_msgs moveit_core moveit_ros_planning_interface Eigen3)
 
 install(TARGETS servo_keyboard_input serial_comm_node
   DESTINATION lib/${PROJECT_NAME})

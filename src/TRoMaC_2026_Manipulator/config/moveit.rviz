@@ -28,6 +28,8 @@ Visualization Manager:
       Planning Request:
         Planning Group: manipulator
         Query Goal State: false
+      Planned Path:
+        Show Robot Visual: false
       Value: true
   Global Options:
     Fixed Frame: base_footprint

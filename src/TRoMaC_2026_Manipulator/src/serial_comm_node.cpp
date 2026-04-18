@@ -7,6 +7,7 @@
 
 #include <moveit/robot_model/robot_model.h>
 #include <moveit/robot_state/robot_state.h>
+#include <moveit/move_group_interface/move_group_interface.h>
 #include <urdf_parser/urdf_parser.h>
 #include <srdfdom/model.h>
 #include <Eigen/Dense>
@@ -26,7 +27,7 @@
 static constexpr char START_SERVO_SERVICE[] = "/servo_node/start_servo";
 
 // 控制模式枚举
-enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 = 2 };
+enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 = 2, HOMING = 3 };
 
 // 前三轴/后三轴关节名
 static const std::vector<std::string> JOINT_GROUP_1_NAMES = {
@@ -71,7 +72,7 @@ public:
     declare_parameter("auto_send", true);
     declare_parameter("send_rate_hz", 100.0);
     declare_parameter("tx_joints", std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
-    declare_parameter("log_auto_send", true);
+    declare_parameter("log_auto_send", false);
 
     // ---- TX 平滑参数 ----
     // tx_smooth_alpha : EMA 平滑因子，0.0~1.0；越小越平滑（延迟越大），1.0=不平滑
@@ -372,7 +373,9 @@ private:
             static_cast<double>(rx_copy.Real_Joint_6)
           };
           recv_pub_->publish(rx_msg);
-          RCLCPP_INFO(
+          if (log_auto_send_)
+          {
+            RCLCPP_INFO(
               get_logger(),
               "RX [#%lu] x=%d y=%d z=%d Pitch=%d Roll=%d Button=%u | "
               "Real_J: %d %d %d %d %d %d",
@@ -389,6 +392,7 @@ private:
               rx_copy.Real_Joint_4,
               rx_copy.Real_Joint_5,
               rx_copy.Real_Joint_6);
+          }
 
           // DEBUG: 打印 RX payload 原始 hex，排查下位机是否填充了 Real_Joint 字段
          /* {
@@ -405,10 +409,12 @@ private:
           {
             // 更新控制模式
             ControlMode new_mode = ControlMode::CARTESIAN;
-            if (rx_copy.Button == 13)
+            if (rx_copy.Button == 9)
               new_mode = ControlMode::JOINT_GROUP_1;
             else if (rx_copy.Button == 11)
               new_mode = ControlMode::JOINT_GROUP_2;
+            else if (rx_copy.Button == 14)
+              new_mode = ControlMode::HOMING;
 
             ControlMode old_mode = control_mode_.exchange(new_mode);
             if (old_mode != new_mode)
@@ -416,29 +422,36 @@ private:
               const char* mode_str =
                   (new_mode == ControlMode::CARTESIAN)     ? "笛卡尔 Servo" :
                   (new_mode == ControlMode::JOINT_GROUP_1) ? "关节遥控 (前三轴: yaw-1, pitch-1, pitch-2)" :
-                                                             "关节遥控 (后三轴: roll-1, pitch-3, roll-2)";
+                  (new_mode == ControlMode::JOINT_GROUP_2) ? "关节遥控 (后三轴: roll-1, pitch-3, roll-2)" :
+                                                             "回初始位姿";
               RCLCPP_INFO(get_logger(), "控制模式切换 → %s", mode_str);
-            }
+
+              // 进入 HOMING 模式时启动回零动作
+              if (new_mode == ControlMode::HOMING && !homing_active_.load())
+              {
+                homing_active_ = true;
+                triggerHoming();
+              }
+            }                                                                                                                                                                                                                                                                                                                
 
             if (new_mode == ControlMode::CARTESIAN)
             {
-              // 平移走笛卡尔 Servo，Roll/Pitch 直接控制末端关节
+              // xyz 平移只用前 3 关节 (yaw-1, pitch-1, pitch-2) 的 Jacobian 求解
+              // roll-1 由摇杆 Roll 直接控制, pitch-3 由摇杆 Pitch 直接控制
               double roll_vel  = applyJoyAxis(rx_copy.Arm_Pos_Roll,  joy_deadzone_angular_, 100, joy_max_angular_);
               double pitch_vel = applyJoyAxis(rx_copy.Arm_Pos_Pitch, joy_deadzone_angular_, 100, joy_max_angular_);
               double lx = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
               double ly = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
               double lz = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
 
-              // ---------- Jacobian 关节限位退化判定 ----------
-              bool use_fallback = false;
+              bool has_xyz   = (std::abs(lx) > 0.0 || std::abs(ly) > 0.0 || std::abs(lz) > 0.0);
+              bool has_rp    = (std::abs(roll_vel) > 0.0 || std::abs(pitch_vel) > 0.0);
 
-              if (jacobian_ready_ && robot_state_ready_.load() &&
-                  (std::abs(lx) > 0.0 || std::abs(ly) > 0.0 || std::abs(lz) > 0.0))
+              // 组装 6 关节速度，默认全零
+              double q_dot[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+              if (has_xyz && jacobian_ready_ && robot_state_ready_.load())
               {
-                // 方向切换检测：如果方向变了，立即回到笛卡尔模式
-                if (directionChanged(lx, ly, lz))
-                  fallback_active_ = false;
-
                 // 取当前关节位置 + Jacobian
                 double jpos[6];
                 Eigen::MatrixXd jacobian;
@@ -448,126 +461,44 @@ private:
                   jacobian = robot_state_->getJacobian(jmg_);
                 }
 
-                // 取 Jacobian 线速度部分 (3×6)
-                Eigen::MatrixXd J_lin = jacobian.block(0, 0, 3, 6);
+                // Jacobian 线速度部分 (3×6)，只取前 3 列 → 3×3
+                Eigen::Matrix3d J_xyz = jacobian.block(0, 0, 3, 3);
                 Eigen::Vector3d v_desired(lx, ly, lz);
 
-                // 先用完整 Jacobian 算一次理论关节速度
-                Eigen::VectorXd q_dot_full = dampedPinvSolve(J_lin, v_desired);
+                // 阻尼伪逆求解前 3 关节速度
+                Eigen::VectorXd q_dot_xyz = dampedPinvSolve(J_xyz, v_desired);
 
-                // 检测哪些关节碰到限位
-                bool is_limiting[6] = {};
-                bool any_limiting = false;
-                for (int i = 0; i < 6; ++i)
+                // 前 3 关节限位检测
+                for (int i = 0; i < 3; ++i)
                 {
                   if (!joint_limits_[i].has_limits) continue;
-                  if (jpos[i] >= joint_limits_[i].upper - LIMIT_MARGIN_RAD && q_dot_full[i] > 0.0)
-                  {
-                    is_limiting[i] = true;
-                    any_limiting = true;
-                  }
-                  if (jpos[i] <= joint_limits_[i].lower + LIMIT_MARGIN_RAD && q_dot_full[i] < 0.0)
-                  {
-                    is_limiting[i] = true;
-                    any_limiting = true;
-                  }
+                  if ((jpos[i] >= joint_limits_[i].upper - LIMIT_MARGIN_RAD && q_dot_xyz[i] > 0.0) ||
+                      (jpos[i] <= joint_limits_[i].lower + LIMIT_MARGIN_RAD && q_dot_xyz[i] < 0.0))
+                    q_dot_xyz[i] = 0.0;
                 }
 
-                if (any_limiting)
-                {
-                  use_fallback = true;
-                  fallback_active_ = true;
-
-                  // 清零碰限位关节的 Jacobian 列，重新求解
-                  Eigen::MatrixXd J_reduced = J_lin;
-                  for (int i = 0; i < 6; ++i)
-                    if (is_limiting[i]) J_reduced.col(i).setZero();
-
-                  Eigen::VectorXd q_dot = dampedPinvSolve(J_reduced, v_desired);
-                  for (int i = 0; i < 6; ++i)
-                    if (is_limiting[i]) q_dot[i] = 0.0;
-
-                  // 叠加末端 Roll/Pitch 直接控制
-                  q_dot[4] += pitch_vel;  // pitch-3-joint
-                  q_dot[3] += roll_vel;   // roll-1-joint
-
-                  // 钳位到 [-1, 1]（unitless，Servo 会乘以 scale.joint）
-                  for (int i = 0; i < 6; ++i)
-                    q_dot[i] = std::clamp(q_dot[i], -1.0, 1.0);
-
-                  // 发零 Twist 清 Servo 缓冲（Twist 优先于 JointJog）
-                  geometry_msgs::msg::TwistStamped zero_twist;
-                  zero_twist.header.stamp    = now();
-                  zero_twist.header.frame_id = planning_frame_;
-                  servo_pub_->publish(zero_twist);
-
-                  // 发 JointJog 驱动未碰限位的关节
-                  auto jnames = get_parameter("joint_names").as_string_array();
-                  control_msgs::msg::JointJog jog;
-                  jog.header.stamp    = now();
-                  jog.header.frame_id = planning_frame_;
-                  jog.joint_names.assign(jnames.begin(), jnames.end());
-                  jog.velocities = {q_dot[0], q_dot[1], q_dot[2],
-                                    q_dot[3], q_dot[4], q_dot[5]};
-                  joint_jog_pub_->publish(jog);
-
-                  if (!prev_fallback_active_)
-                  {
-                    std::string limiting_str;
-                    for (int i = 0; i < 6; ++i)
-                      if (is_limiting[i])
-                        limiting_str += jnames[i] + " ";
-                    RCLCPP_INFO(get_logger(),
-                                "限位退化 → JointJog (碰限位关节: %s)", limiting_str.c_str());
-                  }
-                  prev_fallback_active_ = true;
-                }
-                else
-                {
-                  fallback_active_ = false;
-                  if (prev_fallback_active_)
-                  {
-                    RCLCPP_INFO(get_logger(), "限位退化结束 → 笛卡尔 Servo");
-                    prev_fallback_active_ = false;
-                  }
-                }
-              }
-              else
-              {
-                // 摇杆回中或 Jacobian 未就绪：重置退化状态
-                fallback_active_ = false;
-                if (prev_fallback_active_)
-                {
-                  RCLCPP_INFO(get_logger(), "限位退化结束 → 笛卡尔 Servo");
-                  prev_fallback_active_ = false;
-                }
+                q_dot[0] = std::clamp(q_dot_xyz[0], -1.0, 1.0);  // yaw-1-joint
+                q_dot[1] = std::clamp(q_dot_xyz[1], -1.0, 1.0);  // pitch-1-joint
+                q_dot[2] = std::clamp(q_dot_xyz[2], -1.0, 1.0);  // pitch-2-joint
               }
 
-              // ---------- 正常笛卡尔模式（未触发退化时） ----------
-              if (!use_fallback)
-              {
-                // 1) TwistStamped: 仅平移，angular 全零
-                geometry_msgs::msg::TwistStamped twist;
-                twist.header.stamp    = now();
-                twist.header.frame_id = planning_frame_;
-                twist.twist.linear.x  = lx;
-                twist.twist.linear.y  = ly;
-                twist.twist.linear.z  = lz;
-                servo_pub_->publish(twist);
+              // roll-1, pitch-3 始终由摇杆直接控制（不依赖 Jacobian）
+              q_dot[3] = std::clamp(roll_vel,  -1.0, 1.0);  // roll-1-joint
+              q_dot[4] = std::clamp(pitch_vel, -1.0, 1.0);  // pitch-3-joint
+              // q_dot[5] = 0.0;  // roll-2-joint 不动
 
-                // 2) JointJog: Roll → roll-1-joint, Pitch → pitch-3-joint
-                if (std::abs(roll_vel) > 0.0 || std::abs(pitch_vel) > 0.0)
-                {
-                  control_msgs::msg::JointJog jog;
-                  jog.header.stamp    = now();
-                  jog.header.frame_id = planning_frame_;
-                  jog.joint_names     = {"pitch-3-joint", "roll-1-joint"};
-                  jog.velocities      = {pitch_vel, roll_vel};
-                  joint_jog_pub_->publish(jog);
-                }
-              }
+              // 全部通过 JointJog 发给 Servo（不发 Twist，避免 Twist 优先级抢占）
+              auto jnames = get_parameter("joint_names").as_string_array();
+              control_msgs::msg::JointJog jog;
+              jog.header.stamp    = now();
+              jog.header.frame_id = planning_frame_;
+              jog.joint_names.assign(jnames.begin(), jnames.end());
+              jog.velocities = {q_dot[0], q_dot[1], q_dot[2],
+                                q_dot[3], q_dot[4], q_dot[5]};
+              joint_jog_pub_->publish(jog);
             }
-            else
+            else if (new_mode == ControlMode::JOINT_GROUP_1 ||
+                     new_mode == ControlMode::JOINT_GROUP_2)
             {
               // 关节模式：先发全零 Twist 清除 Servo 内部缓存的笛卡尔指令，
               // 否则 Servo 会优先执行上一帧残留的 Twist 导致其他关节跟着动
@@ -592,6 +523,7 @@ private:
               jog.velocities      = {vel_x, vel_y, vel_z};
               joint_jog_pub_->publish(jog);
             }
+            // HOMING 模式：不发任何 servo 指令，由 MoveGroupInterface 控制
           }
         }
       }
@@ -788,6 +720,109 @@ private:
   static constexpr double LIMIT_MARGIN_RAD = 1.0 * M_PI / 180.0;  // 1°
 
   int prev_sign_[3]{0, 0, 0};  // 方向追踪
+
+  // ---- Homing (回初始位姿) ----
+  std::atomic<bool> homing_active_{false};
+
+  void triggerHoming()
+  {
+    // 在独立线程中执行，避免阻塞 executor 或 readLoop
+    std::thread(&SerialCommNode::executeHoming, this).detach();
+  }
+
+  // 用临时 node 调用服务，避免 executor 死锁
+  static bool callServiceViaTemp(const std::string& service_name,
+                                 const rclcpp::Logger& logger)
+  {
+    auto tmp = rclcpp::Node::make_shared("homing_service_caller");
+    auto client = tmp->create_client<std_srvs::srv::Trigger>(service_name);
+    if (!client->wait_for_service(std::chrono::seconds(2)))
+    {
+      RCLCPP_WARN(logger, "服务 %s 不可用", service_name.c_str());
+      return false;
+    }
+    auto future = client->async_send_request(
+        std::make_shared<std_srvs::srv::Trigger::Request>());
+    if (rclcpp::spin_until_future_complete(tmp, future, std::chrono::seconds(3)) ==
+        rclcpp::FutureReturnCode::SUCCESS)
+      return future.get()->success;
+    RCLCPP_WARN(logger, "调用 %s 超时", service_name.c_str());
+    return false;
+  }
+
+  void executeHoming()
+  {
+    RCLCPP_INFO(get_logger(), "开始回初始位姿…");
+
+    auto logger = get_logger();
+
+    // 1) 暂停 Servo
+    callServiceViaTemp("/servo_node/pause_servo", logger);
+
+    try
+    {
+      // 用临时 node 创建 MoveGroupInterface，自带独立 executor，不死锁
+      auto move_group_node = rclcpp::Node::make_shared(
+          "homing_move_group_node",
+          rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
+
+      // 设置 robot_description 参数（临时 node 需要这些来加载机器人模型）
+      move_group_node->set_parameter(rclcpp::Parameter(
+          "robot_description", get_parameter("robot_description").as_string()));
+      move_group_node->set_parameter(rclcpp::Parameter(
+          "robot_description_semantic", get_parameter("robot_description_semantic").as_string()));
+
+      auto move_group = moveit::planning_interface::MoveGroupInterface(
+          move_group_node, "manipulator");
+
+      move_group.setMaxVelocityScalingFactor(1.0);
+      move_group.setMaxAccelerationScalingFactor(1.0);
+      move_group.setPlanningTime(1.0);
+
+      // 从主 node 的 robot_state_ 获取当前关节状态作为起始状态，
+      // 临时 node 的 getCurrentState 收不到 /joint_states（没有被 spin）
+      if (jacobian_ready_ && robot_state_ready_.load())
+      {
+        std::lock_guard<std::mutex> lock(robot_state_mutex_);
+        robot_state_->enforceBounds();
+        move_group.setStartState(*robot_state_);
+      }
+
+      // 目标 = initial_positions
+      auto joint_names = get_parameter("joint_names").as_string_array();
+      std::vector<double> target_joints(joint_offset_rad_, joint_offset_rad_ + 6);
+      move_group.setJointValueTarget(joint_names, target_joints);
+
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      if (move_group.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS)
+      {
+        RCLCPP_INFO(logger, "规划成功，执行…");
+        auto r = move_group.execute(plan);
+        if (r == moveit::core::MoveItErrorCode::SUCCESS)
+          RCLCPP_INFO(logger, "已到达初始位姿");
+        else
+          RCLCPP_WARN(logger, "执行失败 (code: %d)", r.val);
+      }
+      else
+      {
+        RCLCPP_WARN(logger, "规划失败");
+      }
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_ERROR(logger, "Homing 异常: %s", e.what());
+    }
+
+    // 2) 重启 Servo（stop → start），清除内部旧状态
+    callServiceViaTemp("/servo_node/stop_servo", logger);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    callServiceViaTemp("/servo_node/start_servo", logger);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    homing_active_ = false;
+    control_mode_ = ControlMode::CARTESIAN;
+    RCLCPP_INFO(logger, "Homing 完成，恢复笛卡尔 Servo");
+  }
 };
 
 int main(int argc, char** argv)
