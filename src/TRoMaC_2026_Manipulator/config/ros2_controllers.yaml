@@ -13,12 +13,12 @@ controller_manager:
 manipulator_controller:
   ros__parameters:
     joints:
-      - yaw-1-joint
-      - pitch-1-joint
-      - pitch-2-joint
-      - roll-1-joint
-      - pitch-3-joint
-      - roll-2-joint
+      - 1-joint
+      - 2-joint
+      - 3-joint
+      - 4-joint
+      - 5-joint
+      - 6-joint
     command_interfaces:
       - position
     state_interfaces:

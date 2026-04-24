@@ -31,9 +31,9 @@ enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 =
 
 // 前三轴/后三轴关节名
 static const std::vector<std::string> JOINT_GROUP_1_NAMES = {
-    "yaw-1-joint", "pitch-1-joint", "pitch-2-joint"};
+    "1-joint", "2-joint", "3-joint"};
 static const std::vector<std::string> JOINT_GROUP_2_NAMES = {
-    "roll-1-joint", "pitch-3-joint", "roll-2-joint"};
+    "4-joint", "5-joint", "6-joint"};
 
 // 阻尼伪逆求解：J^+ = V diag(s_i/(s_i²+λ²)) U^T
 static Eigen::VectorXd dampedPinvSolve(const Eigen::MatrixXd& J,
@@ -48,9 +48,7 @@ static Eigen::VectorXd dampedPinvSolve(const Eigen::MatrixXd& J,
   return svd.matrixV() * S_inv.asDiagonal() * svd.matrixU().transpose() * v;
 }
 
-// Apply deadband then scale a raw joystick value to [-max_output, +max_output].
-// Values within [-deadzone, +deadzone] map to exactly 0.
-// At full deflection (±max_raw) the output is ±max_output.
+// 死区处理
 static double applyJoyAxis(int16_t raw, int16_t deadzone, int16_t max_raw, double max_output)
 {
   if (std::abs(raw) <= deadzone) return 0.0;
@@ -65,41 +63,36 @@ class SerialCommNode : public rclcpp::Node
 public:
   SerialCommNode() : Node("serial_comm_node")
   {
-    // ---- Serial parameters ----
+    // 串口相关
     declare_parameter("device", "/dev/ttyUSB0");
     declare_parameter("baud_rate", 921600);
     declare_parameter("send_once_on_start", false);
     declare_parameter("auto_send", true);
     declare_parameter("send_rate_hz", 100.0);
-    declare_parameter("tx_joints", std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
-    declare_parameter("log_auto_send", false);
+    declare_parameter("tx_joints", std::vector<double>{0.0, 0.0, 1.5708, 1.5447, -1.5936, 0.3654});
+    declare_parameter("log_auto_send", true);
 
-    // ---- TX 平滑参数 ----
-    // tx_smooth_alpha : EMA 平滑因子，0.0~1.0；越小越平滑（延迟越大），1.0=不平滑
+    // EMA 平滑策略
     declare_parameter("tx_smooth_alpha", 0.5);
     tx_smooth_alpha_ = get_parameter("tx_smooth_alpha").as_double();
     tx_smooth_alpha_ = std::clamp(tx_smooth_alpha_, 0.01, 1.0);
 
-    // ---- Servo-control parameters ----
-    // enable_servo_control : publish TwistStamped from RX joystick data
-    // planning_frame       : frame_id in TwistStamped header (must match servo config)
-    // joy_deadzone_xyz     : dead-zone for Arm_Pos_x/y/z   (raw units, range ±1000)
-    // joy_deadzone_angular : dead-zone for Arm_Pos_Pitch/Roll (raw units, range ±100)
-    // joy_max_linear       : max normalised linear output  [0.0, 1.0]; 0.5 = half scale
-    // joy_max_angular      : max normalised angular output [0.0, 1.0]; 0.5 = half scale
+    // 摇杆相关
     declare_parameter("enable_servo_control", true);
     declare_parameter("planning_frame", std::string("base_link"));
     declare_parameter("joy_deadzone_xyz", 10);
     declare_parameter("joy_deadzone_angular", 1);
     declare_parameter("joy_max_linear", 1.0);
     declare_parameter("joy_max_angular", 1.0);
+    // X 杆走 pitch1+pitch2 二维 IK，Jacobian 伪逆解出来的关节速度会按这个值放大
+    declare_parameter("decouple_ee_max", 1.0);
 
-    // Cache parameters so the readLoop thread doesn't hit the parameter map.
     planning_frame_      = get_parameter("planning_frame").as_string();
     joy_deadzone_xyz_    = static_cast<int16_t>(get_parameter("joy_deadzone_xyz").as_int());
     joy_deadzone_angular_= static_cast<int16_t>(get_parameter("joy_deadzone_angular").as_int());
     joy_max_linear_      = get_parameter("joy_max_linear").as_double();
     joy_max_angular_     = get_parameter("joy_max_angular").as_double();
+    decouple_ee_max_     = get_parameter("decouple_ee_max").as_double();
     log_auto_send_       = get_parameter("log_auto_send").as_bool();
 
     auto device = get_parameter("device").as_string();
@@ -159,8 +152,8 @@ public:
     // log_joint_state_tx    : log each TX frame
     declare_parameter("enable_joint_state_tx", true);
     declare_parameter("joint_names", std::vector<std::string>{
-        "yaw-1-joint", "pitch-1-joint", "pitch-2-joint",
-        "roll-1-joint", "pitch-3-joint", "roll-2-joint"});
+        "1-joint", "2-joint", "3-joint",
+        "4-joint", "5-joint", "6-joint"});
     declare_parameter("log_joint_state_tx", false);
 
     if (get_parameter("enable_joint_state_tx").as_bool())
@@ -256,9 +249,17 @@ public:
     }
 
     jacobian_ready_ = true;
+
+    // Jacobian 参考 link: 4_Link（3-joint 控制链末端），
+    // 前 3 关节只能控制到这里，用 6Link 会因后三连杆产生偏移导致斜行
+    jacobian_link_ = robot_model_->getLinkModel("4_Link");
+    if (!jacobian_link_)
+      RCLCPP_WARN(get_logger(), "未找到 4_Link，Jacobian 将使用默认末端 link");
+
     RCLCPP_INFO(get_logger(),
-                "Jacobian 关节限位退化模式已初始化 (margin=%.1f°)",
-                LIMIT_MARGIN_RAD * 180.0 / M_PI);
+                "Jacobian 已初始化 (margin=%.1f°, ref_link=%s)",
+                LIMIT_MARGIN_RAD * 180.0 / M_PI,
+                jacobian_link_ ? jacobian_link_->getName().c_str() : "6Link");
   }
 
   ~SerialCommNode() override
@@ -413,7 +414,7 @@ private:
               new_mode = ControlMode::JOINT_GROUP_1;
             else if (rx_copy.Button == 11)
               new_mode = ControlMode::JOINT_GROUP_2;
-            else if (rx_copy.Button == 14)
+            else if (rx_copy.Button == 12)
               new_mode = ControlMode::HOMING;
 
             ControlMode old_mode = control_mode_.exchange(new_mode);
@@ -421,8 +422,8 @@ private:
             {
               const char* mode_str =
                   (new_mode == ControlMode::CARTESIAN)     ? "笛卡尔 Servo" :
-                  (new_mode == ControlMode::JOINT_GROUP_1) ? "关节遥控 (前三轴: yaw-1, pitch-1, pitch-2)" :
-                  (new_mode == ControlMode::JOINT_GROUP_2) ? "关节遥控 (后三轴: roll-1, pitch-3, roll-2)" :
+                  (new_mode == ControlMode::JOINT_GROUP_1) ? "关节遥控 (前三轴: 1, 2, 3)" :
+                  (new_mode == ControlMode::JOINT_GROUP_2) ? "关节遥控 (后三轴: 4, 5, 6)" :
                                                              "回初始位姿";
               RCLCPP_INFO(get_logger(), "控制模式切换 → %s", mode_str);
 
@@ -436,65 +437,68 @@ private:
 
             if (new_mode == ControlMode::CARTESIAN)
             {
-              // xyz 平移只用前 3 关节 (yaw-1, pitch-1, pitch-2) 的 Jacobian 求解
-              // roll-1 由摇杆 Roll 直接控制, pitch-3 由摇杆 Pitch 直接控制
-              double roll_vel  = applyJoyAxis(rx_copy.Arm_Pos_Roll,  joy_deadzone_angular_, 100, joy_max_angular_);
-              double pitch_vel = applyJoyAxis(rx_copy.Arm_Pos_Pitch, joy_deadzone_angular_, 100, joy_max_angular_);
-              double lx = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double ly = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double lz = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              // —— 全解耦摇杆控制 ——
+              // 不再走 6 轴笛卡尔 servo IK（那条路无论怎么映射，只要 yaw≠0
+              // 就会让大 yaw 跟着 X 杆动），改成把每个杆量映射到独立的物理意义、
+              // 用单条 JointJog 直接驱动各关节：
+              //   X 杆 → 沿手臂当前方位「伸/缩」(pitch1+pitch2 协调，2D Jacobian 伪逆)
+              //   Z 杆 → 同一竖直面内「抬/降」 (pitch1+pitch2 协调)
+              //   Y 杆 → 1-joint (大 yaw)
+              //   pitch 杆 → 5-joint
+              //   roll  杆 → 4-joint
+              //   6-joint 暂不绑定（保持 0），以后想接哪个杆/按键再加
+              //
+              // 因为 J_pitch 完全不含 yaw 列，物理上保证 X / Z 杆不会让 yaw 动。
 
-              bool has_xyz   = (std::abs(lx) > 0.0 || std::abs(ly) > 0.0 || std::abs(lz) > 0.0);
-              bool has_rp    = (std::abs(roll_vel) > 0.0 || std::abs(pitch_vel) > 0.0);
+              double vx = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vy = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vz = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double v_roll  = applyJoyAxis(rx_copy.Arm_Pos_Roll,  joy_deadzone_angular_, 100, joy_max_angular_);
+              double v_pitch = applyJoyAxis(rx_copy.Arm_Pos_Pitch, joy_deadzone_angular_, 100, joy_max_angular_);
 
-              // 组装 6 关节速度，默认全零
-              double q_dot[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+              // 直接 jog 的关节速度：[1, _, _, 4, 5, 6]
+              double q_dot[6] = {vy, 0.0, 0.0, v_roll, v_pitch, 0.0};
 
-              if (has_xyz && jacobian_ready_ && robot_state_ready_.load())
+              if (jacobian_ready_ && robot_state_ready_.load() &&
+                  (vx != 0.0 || vz != 0.0))
               {
-                // 取当前关节位置 + Jacobian
-                double jpos[6];
-                Eigen::MatrixXd jacobian;
+                Eigen::MatrixXd J;
+                double yaw = 0.0;
                 {
                   std::lock_guard<std::mutex> lock(robot_state_mutex_);
-                  std::copy(current_joint_pos_, current_joint_pos_ + 6, jpos);
-                  jacobian = robot_state_->getJacobian(jmg_);
+                  yaw = current_joint_pos_[0];
+                  robot_state_->getJacobian(jmg_, jacobian_link_,
+                                            Eigen::Vector3d::Zero(), J);
                 }
+                // 取 2-joint, 3-joint 的线性贡献列
+                Eigen::MatrixXd J_pitch(3, 2);
+                J_pitch.col(0) = J.block<3, 1>(0, 1);
+                J_pitch.col(1) = J.block<3, 1>(0, 2);
 
-                // Jacobian 线速度部分 (3×6)，只取前 3 列 → 3×3
-                Eigen::Matrix3d J_xyz = jacobian.block(0, 0, 3, 3);
-                Eigen::Vector3d v_desired(lx, ly, lz);
+                // X 杆 → 沿当前方位「径向」分量；Z 杆 → 竖直分量
+                Eigen::Vector3d v_des(decouple_ee_max_ * vx * std::cos(yaw),
+                                      decouple_ee_max_ * vx * std::sin(yaw),
+                                      decouple_ee_max_ * vz);
 
-                // 阻尼伪逆求解前 3 关节速度
-                Eigen::VectorXd q_dot_xyz = dampedPinvSolve(J_xyz, v_desired);
-
-                // 前 3 关节限位检测
-                for (int i = 0; i < 3; ++i)
-                {
-                  if (!joint_limits_[i].has_limits) continue;
-                  if ((jpos[i] >= joint_limits_[i].upper - LIMIT_MARGIN_RAD && q_dot_xyz[i] > 0.0) ||
-                      (jpos[i] <= joint_limits_[i].lower + LIMIT_MARGIN_RAD && q_dot_xyz[i] < 0.0))
-                    q_dot_xyz[i] = 0.0;
-                }
-
-                q_dot[0] = std::clamp(q_dot_xyz[0], -1.0, 1.0);  // yaw-1-joint
-                q_dot[1] = std::clamp(q_dot_xyz[1], -1.0, 1.0);  // pitch-1-joint
-                q_dot[2] = std::clamp(q_dot_xyz[2], -1.0, 1.0);  // pitch-2-joint
+                Eigen::Vector2d q_pitch = dampedPinvSolve(J_pitch, v_des, 0.05);
+                // servo unitless 模式下 JointJog 速度被 clamp 到 [-1, 1]
+                q_dot[1] = std::clamp(q_pitch[0], -1.0, 1.0);
+                q_dot[2] = std::clamp(q_pitch[1], -1.0, 1.0);
               }
 
-              // roll-1, pitch-3 始终由摇杆直接控制（不依赖 Jacobian）
-              q_dot[3] = std::clamp(roll_vel,  -1.0, 1.0);  // roll-1-joint
-              q_dot[4] = std::clamp(pitch_vel, -1.0, 1.0);  // pitch-3-joint
-              // q_dot[5] = 0.0;  // roll-2-joint 不动
+              // 切到 JointJog 路径前先清掉 servo 内部缓存的 cartesian 残值
+              geometry_msgs::msg::TwistStamped zero_twist;
+              zero_twist.header.stamp    = now();
+              zero_twist.header.frame_id = planning_frame_;
+              servo_pub_->publish(zero_twist);
 
-              // 全部通过 JointJog 发给 Servo（不发 Twist，避免 Twist 优先级抢占）
-              auto jnames = get_parameter("joint_names").as_string_array();
               control_msgs::msg::JointJog jog;
               jog.header.stamp    = now();
               jog.header.frame_id = planning_frame_;
-              jog.joint_names.assign(jnames.begin(), jnames.end());
-              jog.velocities = {q_dot[0], q_dot[1], q_dot[2],
-                                q_dot[3], q_dot[4], q_dot[5]};
+              jog.joint_names = {"1-joint", "2-joint", "3-joint",
+                                 "4-joint", "5-joint", "6-joint"};
+              jog.velocities  = {q_dot[0], q_dot[1], q_dot[2],
+                                 q_dot[3], q_dot[4], q_dot[5]};
               joint_jog_pub_->publish(jog);
             }
             else if (new_mode == ControlMode::JOINT_GROUP_1 ||
@@ -512,9 +516,9 @@ private:
                                             ? JOINT_GROUP_1_NAMES
                                             : JOINT_GROUP_2_NAMES;
 
-              double vel_x = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vel_y = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vel_z = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_x = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_y = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
+              double vel_z = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
 
               control_msgs::msg::JointJog jog;
               jog.header.stamp    = now();
@@ -662,14 +666,14 @@ private:
   std::atomic<bool> running_{false};
 
   // 下位机电机零点在 ROS 坐标系下的弧度值 (initial_positions)
-  // 顺序：yaw-1, pitch-1, pitch-2, roll-1, pitch-3, roll-2
+  // 顺序：1-joint, 2-joint, 3-joint, 4-joint, 5-joint, 6-joint
   static constexpr double joint_offset_rad_[6] = {
-    -3.1415,   // yaw-1-joint
-    -3.1416,   // pitch-1-joint
-    -3.7070,   // pitch-2-joint
-     0.0868,   // roll-1-joint
-     0.4750,   // pitch-3-joint
-     0.0        // roll-2-joint
+    0.0,
+    0.0,
+    1.5708,
+    1.5447,
+    -1.5936,
+    0.3654
   };
 
   std::mutex                            rx_mutex_;
@@ -702,12 +706,14 @@ private:
   int16_t      joy_deadzone_angular_{3};
   double       joy_max_linear_{0.5};
   double       joy_max_angular_{0.5};
+  double       decouple_ee_max_{0.3};
   bool         log_auto_send_{false};
 
   // ---- Jacobian 关节限位退化 ----
   moveit::core::RobotModelPtr                     robot_model_;
   std::shared_ptr<moveit::core::RobotState>       robot_state_;
   const moveit::core::JointModelGroup*             jmg_{nullptr};
+  const moveit::core::LinkModel*                   jacobian_link_{nullptr};
   std::mutex                                       robot_state_mutex_;
   double                                           current_joint_pos_[6]{};
   std::atomic<bool>                                robot_state_ready_{false};

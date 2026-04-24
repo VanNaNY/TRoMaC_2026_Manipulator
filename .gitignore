@@ -15,6 +15,9 @@ compile_commands.json
 CMakeCache.txt
 CMakeFiles/
 
+# Node (local tooling; never commit dependencies)
+node_modules/
+
 # IDE / OS
 .idea/
 .vscode/
