@@ -1,3 +1,10 @@
+// serial_comm_node — 精简版
+// 串口通信已移交 TRoMaCHardwareInterface (ros2_control 插件)
+// 本节点仅负责：
+//   1. 订阅 /serial_recv（hardware interface 发布的摇杆数据）驱动 MoveIt Servo
+//   2. 订阅 /joint_states 更新 RobotState 供 Jacobian 退化使用
+//   3. Homing（回零）功能
+
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
@@ -12,8 +19,6 @@
 #include <srdfdom/model.h>
 #include <Eigen/Dense>
 
-#include "Serial.h"
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -22,7 +27,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <sys/select.h>
 
 static constexpr char START_SERVO_SERVICE[] = "/servo_node/start_servo";
 
@@ -63,128 +67,55 @@ class SerialCommNode : public rclcpp::Node
 public:
   SerialCommNode() : Node("serial_comm_node")
   {
-    // 串口相关
-    declare_parameter("device", "/dev/ttyUSB0");
-    declare_parameter("baud_rate", 921600);
-    declare_parameter("send_once_on_start", false);
-    declare_parameter("auto_send", true);
-    declare_parameter("send_rate_hz", 100.0);
-    declare_parameter("tx_joints", std::vector<double>{0.0, 0.0, 1.5708, 1.5447, -1.5936, 0.3654});
-    declare_parameter("log_auto_send", true);
-
-    // EMA 平滑策略
-    declare_parameter("tx_smooth_alpha", 0.5);
-    tx_smooth_alpha_ = get_parameter("tx_smooth_alpha").as_double();
-    tx_smooth_alpha_ = std::clamp(tx_smooth_alpha_, 0.01, 1.0);
-
-    // 摇杆相关
+    // 摇杆相关参数
     declare_parameter("enable_servo_control", true);
     declare_parameter("planning_frame", std::string("base_link"));
     declare_parameter("joy_deadzone_xyz", 10);
     declare_parameter("joy_deadzone_angular", 1);
     declare_parameter("joy_max_linear", 1.0);
     declare_parameter("joy_max_angular", 1.0);
-    // X 杆走 pitch1+pitch2 二维 IK，Jacobian 伪逆解出来的关节速度会按这个值放大
     declare_parameter("decouple_ee_max", 1.0);
+    declare_parameter("send_log", true);
 
-    planning_frame_      = get_parameter("planning_frame").as_string();
-    joy_deadzone_xyz_    = static_cast<int16_t>(get_parameter("joy_deadzone_xyz").as_int());
-    joy_deadzone_angular_= static_cast<int16_t>(get_parameter("joy_deadzone_angular").as_int());
-    joy_max_linear_      = get_parameter("joy_max_linear").as_double();
-    joy_max_angular_     = get_parameter("joy_max_angular").as_double();
-    decouple_ee_max_     = get_parameter("decouple_ee_max").as_double();
-    log_auto_send_       = get_parameter("log_auto_send").as_bool();
-
-    auto device = get_parameter("device").as_string();
-    auto baud   = static_cast<int>(get_parameter("baud_rate").as_int());
-
-    if (!uart_.Open(device, baud))
-    {
-      RCLCPP_FATAL(get_logger(), "无法打开串口: %s @ %d", device.c_str(), baud);
-      throw std::runtime_error("Serial port open failed");
-    }
-    RCLCPP_INFO(get_logger(), "串口已打开: %s @ %d baud", device.c_str(), baud);
-
-    // 必须在后台线程启动前创建所有 publisher/subscriber，避免线程调用 null publisher
-    send_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
-        "serial_send", 12,
-        std::bind(&SerialCommNode::sendCallback, this, std::placeholders::_1));
-
-    recv_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>("serial_recv", 10);
-
-    running_ = true;
-    read_thread_ = std::thread(&SerialCommNode::readLoop, this);
-
-    if (get_parameter("send_once_on_start").as_bool())
-    {
-      auto tx = get_parameter("tx_joints").as_double_array();
-      if (tx.size() >= 6)
-      {
-        sendFromDoubles(tx.data());
-        RCLCPP_INFO(get_logger(), "启动时已向下位机发送一帧 (tx_joints)");
-      }
-      else
-      {
-        RCLCPP_WARN(get_logger(),
-                    "send_once_on_start 为 true 但 tx_joints 不足 6 个数，跳过启动发送");
-      }
-    }
-
-    if (get_parameter("auto_send").as_bool())
-    {
-      double hz = get_parameter("send_rate_hz").as_double();
-      if (hz <= 0.0) hz = 10.0;
-      const auto period_ns = static_cast<int64_t>(1e9 / hz);
-      send_timer_ = create_wall_timer(
-          std::chrono::nanoseconds(period_ns),
-          std::bind(&SerialCommNode::autoSendTimer, this));
-      RCLCPP_INFO(get_logger(), "auto_send 已启动 @ %.1f Hz", hz);
-    }
-    else
-    {
-      RCLCPP_INFO(get_logger(),
-                  "设 auto_send:=true，或向话题 serial_send 发 Float64MultiArray(6个数)");
-    }
-
-    // ---- Joint-state → serial TX ----
-    // enable_joint_state_tx : subscribe /joint_states and forward angles to MCU
-    // joint_names           : ordered list of the 6 joint names (matches VisionData Joint_1..6)
-    // log_joint_state_tx    : log each TX frame
-    declare_parameter("enable_joint_state_tx", true);
     declare_parameter("joint_names", std::vector<std::string>{
         "1-joint", "2-joint", "3-joint",
         "4-joint", "5-joint", "6-joint"});
-    declare_parameter("log_joint_state_tx", false);
 
-    if (get_parameter("enable_joint_state_tx").as_bool())
-    {
-      joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-          "/joint_states", 10,
-          std::bind(&SerialCommNode::jointStateCallback, this, std::placeholders::_1));
-      RCLCPP_INFO(get_logger(), "joint_state → serial TX 已启用，订阅 /joint_states");
-    }
+    planning_frame_       = get_parameter("planning_frame").as_string();
+    joy_deadzone_xyz_     = static_cast<int16_t>(get_parameter("joy_deadzone_xyz").as_int());
+    joy_deadzone_angular_ = static_cast<int16_t>(get_parameter("joy_deadzone_angular").as_int());
+    joy_max_linear_       = get_parameter("joy_max_linear").as_double();
+    joy_max_angular_      = get_parameter("joy_max_angular").as_double();
+    decouple_ee_max_      = get_parameter("decouple_ee_max").as_double();
+    send_log_             = get_parameter("send_log").as_bool();
 
-    // ---- Servo control setup ----
+    // 订阅 serial_recv topic（由 TRoMaCHardwareInterface 发布）
+    recv_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
+        "serial_recv", 10,
+        std::bind(&SerialCommNode::recvCallback, this, std::placeholders::_1));
+
+    // servo控制
     if (get_parameter("enable_servo_control").as_bool())
     {
       enable_servo_control_ = true;
 
-      // 使用 SystemDefaultsQoS 匹配 servo_node subscriber 的 BEST_EFFORT QoS
       servo_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
           "/servo_node/delta_twist_cmds", rclcpp::SystemDefaultsQoS());
 
-      // 关节模式 JointJog publisher
       joint_jog_pub_ = create_publisher<control_msgs::msg::JointJog>(
           "/servo_node/delta_joint_cmds", rclcpp::SystemDefaultsQoS());
 
-      // 不再使用定时器发布——改为在 readLoop 中收到串口数据后直接发布 twist，
-      // 和键盘节点一样的事件驱动模式。
       std::thread([this]() { this->callStartServo(); }).detach();
 
       RCLCPP_INFO(get_logger(),
-                  "串口 Servo 控制已启用 (事件驱动)  (linear_max=%.2f  angular_max=%.2f)",
+                  "Servo 控制已启用 (linear_max=%.2f  angular_max=%.2f)",
                   joy_max_linear_, joy_max_angular_);
     }
+
+    // 订阅 /joint_states 用于 Jacobian 计算
+    joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+        "/joint_states", 10,
+        std::bind(&SerialCommNode::jointStateCallback, this, std::placeholders::_1));
   }
 
   // 初始化 Jacobian 退化功能（需在 make_shared 后调用以获取 robot_description 参数）
@@ -192,7 +123,6 @@ public:
   {
     if (!enable_servo_control_) return;
 
-    // 从 launch 传入的参数读取 URDF / SRDF
     declare_parameter("robot_description", std::string(""));
     declare_parameter("robot_description_semantic", std::string(""));
     std::string urdf_xml = get_parameter("robot_description").as_string();
@@ -228,7 +158,6 @@ public:
       return;
     }
 
-    // 从 URDF 提取每个关节的限位
     auto joint_names = get_parameter("joint_names").as_string_array();
     for (int i = 0; i < 6; ++i)
     {
@@ -250,8 +179,6 @@ public:
 
     jacobian_ready_ = true;
 
-    // Jacobian 参考 link: 4_Link（3-joint 控制链末端），
-    // 前 3 关节只能控制到这里，用 6Link 会因后三连杆产生偏移导致斜行
     jacobian_link_ = robot_model_->getLinkModel("4_Link");
     if (!jacobian_link_)
       RCLCPP_WARN(get_logger(), "未找到 4_Link，Jacobian 将使用默认末端 link");
@@ -262,291 +189,195 @@ public:
                 jacobian_link_ ? jacobian_link_->getName().c_str() : "6Link");
   }
 
-  ~SerialCommNode() override
-  {
-    running_ = false;
-    if (read_thread_.joinable())
-      read_thread_.join();
-    uart_.Close();
-  }
-
 private:
-  // ---- TX helpers ----
-
-  void sendFromDoubles(const double* j)
+  // ---- serial_recv topic 回调：处理摇杆数据并驱动 Servo ----
+  void recvCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
   {
-    TRoMaC::VisionData vd{};
-    vd.Joint_1 = static_cast<int16_t>(j[0]);
-    vd.Joint_2 = static_cast<int16_t>(j[1]);
-    vd.Joint_3 = static_cast<int16_t>(j[2]);
-    vd.Joint_4 = static_cast<int16_t>(j[3]);
-    vd.Joint_5 = static_cast<int16_t>(j[4]);
-    vd.Joint_6 = static_cast<int16_t>(j[5]);
-    uart_.send(vd);
-  }
+    // 数据格式: [x, y, z, pitch, roll, button, real_j1~j6]
+    if (msg->data.size() < 6) return;
 
-  void autoSendTimer()
-  {
-    double target[6];
-    {
-      std::lock_guard<std::mutex> lock(joint_tx_mutex_);
-      if (joint_tx_ready_)
-      {
-        std::copy(latest_joint_tx_, latest_joint_tx_ + 6, target);
-      }
-      else
-      {
-        auto param = get_parameter("tx_joints").as_double_array();
-        if (static_cast<int>(param.size()) < 6) return;
-        std::copy(param.begin(), param.begin() + 6, target);
-      }
-    }
+    int16_t arm_x     = static_cast<int16_t>(msg->data[0]);
+    int16_t arm_y     = static_cast<int16_t>(msg->data[1]);
+    int16_t arm_z     = static_cast<int16_t>(msg->data[2]);
+    int16_t arm_pitch = static_cast<int16_t>(msg->data[3]);
+    int16_t arm_roll  = static_cast<int16_t>(msg->data[4]);
+    uint8_t button    = static_cast<uint8_t>(msg->data[5]);
 
-    // ---- EMA 平滑插值 ----
-    // 首帧直接跳到目标，避免从 0 开始缓慢爬升
-    if (!tx_smooth_initialized_)
-    {
-      std::copy(target, target + 6, smoothed_tx_);
-      tx_smooth_initialized_ = true;
-    }
-    else
-    {
-      for (int i = 0; i < 6; ++i)
-      {
-        smoothed_tx_[i] += tx_smooth_alpha_ * (target[i] - smoothed_tx_[i]);
-      }
-    }
-
-    sendFromDoubles(smoothed_tx_);
-    if (log_auto_send_)
+    if (send_log_)
     {
       RCLCPP_INFO(get_logger(),
-                  "auto_send(smooth): %.1f,%.1f,%.1f,%.1f,%.1f,%.1f deg",
-                  smoothed_tx_[0], smoothed_tx_[1],
-                  smoothed_tx_[2], smoothed_tx_[3],
-                  smoothed_tx_[4], smoothed_tx_[5]);
+                  "RX: x=%d y=%d z=%d P=%d R=%d Btn=%u | "
+                  "Real_J: %d %d %d %d %d %d",
+                  arm_x, arm_y, arm_z, arm_pitch, arm_roll, button,
+                  msg->data.size() >= 12
+                    ? static_cast<int>(msg->data[6])  : 0,
+                  msg->data.size() >= 12
+                    ? static_cast<int>(msg->data[7])  : 0,
+                  msg->data.size() >= 12
+                    ? static_cast<int>(msg->data[8])  : 0,
+                  msg->data.size() >= 12
+                    ? static_cast<int>(msg->data[9])  : 0,
+                  msg->data.size() >= 12
+                    ? static_cast<int>(msg->data[10]) : 0,
+                  msg->data.size() >= 12
+                    ? static_cast<int>(msg->data[11]) : 0);
     }
-  }
 
-  // ---- RX background thread ----
+    if (!enable_servo_control_) return;
 
-  void readLoop()
-  {
-    while (running_)
+    // 按键切换控制模式
+    ControlMode new_mode = ControlMode::CARTESIAN;
+    if (button == 9)
+      new_mode = ControlMode::JOINT_GROUP_1;
+    else if (button == 11)
+      new_mode = ControlMode::JOINT_GROUP_2;
+    else if (button == 12)
+      new_mode = ControlMode::HOMING;
+
+    ControlMode old_mode = control_mode_.exchange(new_mode);
+    if (old_mode != new_mode)
     {
-      fd_set fds;
-      FD_ZERO(&fds);
-      FD_SET(uart_.serial_id, &fds);
-      struct timeval tv{};
-      tv.tv_sec  = 0;
-      tv.tv_usec = 300000;  // 300 ms select timeout
+      const char* mode_str =
+          (new_mode == ControlMode::CARTESIAN)     ? "笛卡尔 Servo" :
+          (new_mode == ControlMode::JOINT_GROUP_1) ? "关节遥控 (前三轴: 1, 2, 3)" :
+          (new_mode == ControlMode::JOINT_GROUP_2) ? "关节遥控 (后三轴: 4, 5, 6)" :
+                                                     "回初始位姿";
+      RCLCPP_INFO(get_logger(), "控制模式切换 → %s", mode_str);
 
-      int ret = select(uart_.serial_id + 1, &fds, nullptr, nullptr, &tv);
-      if (ret > 0 && FD_ISSET(uart_.serial_id, &fds))
+      if (new_mode == ControlMode::HOMING && !homing_active_.load())
       {
-        while (running_ && uart_.ReadData())
-        {
-          TRoMaC::VisionFrameRX_structTypedef rx_copy{};
-          uint64_t count = 0;
-          {
-            std::lock_guard<std::mutex> lock(rx_mutex_);
-            latest_rx_    = uart_.read_data;
-            last_rx_time_ = std::chrono::steady_clock::now();
-            rx_count_++;
-            rx_copy = latest_rx_;
-            count   = rx_count_;
-          }
-
-          // 发布到 ROS 话题，字段顺序：x, y, z, pitch, roll, button, real_j1~j6
-          std_msgs::msg::Float64MultiArray rx_msg;
-          rx_msg.data = {
-            static_cast<double>(rx_copy.Arm_Pos_x),
-            static_cast<double>(rx_copy.Arm_Pos_y),
-            static_cast<double>(rx_copy.Arm_Pos_z),
-            static_cast<double>(rx_copy.Arm_Pos_Pitch),
-            static_cast<double>(rx_copy.Arm_Pos_Roll),
-            static_cast<double>(rx_copy.Button),
-            static_cast<double>(rx_copy.Real_Joint_1),
-            static_cast<double>(rx_copy.Real_Joint_2),
-            static_cast<double>(rx_copy.Real_Joint_3),
-            static_cast<double>(rx_copy.Real_Joint_4),
-            static_cast<double>(rx_copy.Real_Joint_5),
-            static_cast<double>(rx_copy.Real_Joint_6)
-          };
-          recv_pub_->publish(rx_msg);
-          if (log_auto_send_)
-          {
-            RCLCPP_INFO(
-              get_logger(),
-              "RX [#%lu] x=%d y=%d z=%d Pitch=%d Roll=%d Button=%u | "
-              "Real_J: %d %d %d %d %d %d",
-              count,
-              rx_copy.Arm_Pos_x,
-              rx_copy.Arm_Pos_y,
-              rx_copy.Arm_Pos_z,
-              rx_copy.Arm_Pos_Pitch,
-              rx_copy.Arm_Pos_Roll,
-              rx_copy.Button,
-              rx_copy.Real_Joint_1,
-              rx_copy.Real_Joint_2,
-              rx_copy.Real_Joint_3,
-              rx_copy.Real_Joint_4,
-              rx_copy.Real_Joint_5,
-              rx_copy.Real_Joint_6);
-          }
-
-          // DEBUG: 打印 RX payload 原始 hex，排查下位机是否填充了 Real_Joint 字段
-         /* {
-            const auto* p = reinterpret_cast<const uint8_t*>(&rx_copy);
-            char hex[RX_PAYLOAD_SIZE * 3 + 1];
-            for (int i = 0; i < RX_PAYLOAD_SIZE; ++i)
-              snprintf(hex + i * 3, 4, "%02X ", p[i]);
-            hex[RX_PAYLOAD_SIZE * 3] = '\0';
-            RCLCPP_INFO(get_logger(), "RX payload hex: %s", hex);
-          }*/
-
-          // 根据按键切换控制模式（电平式：按下瞬间触发，松开回到其他值）
-          if (enable_servo_control_)
-          {
-            // 更新控制模式
-            ControlMode new_mode = ControlMode::CARTESIAN;
-            if (rx_copy.Button == 9)
-              new_mode = ControlMode::JOINT_GROUP_1;
-            else if (rx_copy.Button == 11)
-              new_mode = ControlMode::JOINT_GROUP_2;
-            else if (rx_copy.Button == 12)
-              new_mode = ControlMode::HOMING;
-
-            ControlMode old_mode = control_mode_.exchange(new_mode);
-            if (old_mode != new_mode)
-            {
-              const char* mode_str =
-                  (new_mode == ControlMode::CARTESIAN)     ? "笛卡尔 Servo" :
-                  (new_mode == ControlMode::JOINT_GROUP_1) ? "关节遥控 (前三轴: 1, 2, 3)" :
-                  (new_mode == ControlMode::JOINT_GROUP_2) ? "关节遥控 (后三轴: 4, 5, 6)" :
-                                                             "回初始位姿";
-              RCLCPP_INFO(get_logger(), "控制模式切换 → %s", mode_str);
-
-              // 进入 HOMING 模式时启动回零动作
-              if (new_mode == ControlMode::HOMING && !homing_active_.load())
-              {
-                homing_active_ = true;
-                triggerHoming();
-              }
-            }                                                                                                                                                                                                                                                                                                                
-
-            if (new_mode == ControlMode::CARTESIAN)
-            {
-              // —— 全解耦摇杆控制 ——
-              // 不再走 6 轴笛卡尔 servo IK（那条路无论怎么映射，只要 yaw≠0
-              // 就会让大 yaw 跟着 X 杆动），改成把每个杆量映射到独立的物理意义、
-              // 用单条 JointJog 直接驱动各关节：
-              //   X 杆 → 沿手臂当前方位「伸/缩」(pitch1+pitch2 协调，2D Jacobian 伪逆)
-              //   Z 杆 → 同一竖直面内「抬/降」 (pitch1+pitch2 协调)
-              //   Y 杆 → 1-joint (大 yaw)
-              //   pitch 杆 → 5-joint
-              //   roll  杆 → 4-joint
-              //   6-joint 暂不绑定（保持 0），以后想接哪个杆/按键再加
-              //
-              // 因为 J_pitch 完全不含 yaw 列，物理上保证 X / Z 杆不会让 yaw 动。
-
-              double vx = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vy = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vz = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double v_roll  = applyJoyAxis(rx_copy.Arm_Pos_Roll,  joy_deadzone_angular_, 100, joy_max_angular_);
-              double v_pitch = applyJoyAxis(rx_copy.Arm_Pos_Pitch, joy_deadzone_angular_, 100, joy_max_angular_);
-
-              // 直接 jog 的关节速度：[1, _, _, 4, 5, 6]
-              double q_dot[6] = {vy, 0.0, 0.0, v_roll, v_pitch, 0.0};
-
-              if (jacobian_ready_ && robot_state_ready_.load() &&
-                  (vx != 0.0 || vz != 0.0))
-              {
-                Eigen::MatrixXd J;
-                double yaw = 0.0;
-                {
-                  std::lock_guard<std::mutex> lock(robot_state_mutex_);
-                  yaw = current_joint_pos_[0];
-                  robot_state_->getJacobian(jmg_, jacobian_link_,
-                                            Eigen::Vector3d::Zero(), J);
-                }
-                // 取 2-joint, 3-joint 的线性贡献列
-                Eigen::MatrixXd J_pitch(3, 2);
-                J_pitch.col(0) = J.block<3, 1>(0, 1);
-                J_pitch.col(1) = J.block<3, 1>(0, 2);
-
-                // X 杆 → 沿当前方位「径向」分量；Z 杆 → 竖直分量
-                Eigen::Vector3d v_des(decouple_ee_max_ * vx * std::cos(yaw),
-                                      decouple_ee_max_ * vx * std::sin(yaw),
-                                      decouple_ee_max_ * vz);
-
-                Eigen::Vector2d q_pitch = dampedPinvSolve(J_pitch, v_des, 0.05);
-                // servo unitless 模式下 JointJog 速度被 clamp 到 [-1, 1]
-                q_dot[1] = std::clamp(q_pitch[0], -1.0, 1.0);
-                q_dot[2] = std::clamp(q_pitch[1], -1.0, 1.0);
-              }
-
-              // 切到 JointJog 路径前先清掉 servo 内部缓存的 cartesian 残值
-              geometry_msgs::msg::TwistStamped zero_twist;
-              zero_twist.header.stamp    = now();
-              zero_twist.header.frame_id = planning_frame_;
-              servo_pub_->publish(zero_twist);
-
-              control_msgs::msg::JointJog jog;
-              jog.header.stamp    = now();
-              jog.header.frame_id = planning_frame_;
-              jog.joint_names = {"1-joint", "2-joint", "3-joint",
-                                 "4-joint", "5-joint", "6-joint"};
-              jog.velocities  = {q_dot[0], q_dot[1], q_dot[2],
-                                 q_dot[3], q_dot[4], q_dot[5]};
-              joint_jog_pub_->publish(jog);
-            }
-            else if (new_mode == ControlMode::JOINT_GROUP_1 ||
-                     new_mode == ControlMode::JOINT_GROUP_2)
-            {
-              // 关节模式：先发全零 Twist 清除 Servo 内部缓存的笛卡尔指令，
-              // 否则 Servo 会优先执行上一帧残留的 Twist 导致其他关节跟着动
-              geometry_msgs::msg::TwistStamped zero_twist;
-              zero_twist.header.stamp    = now();
-              zero_twist.header.frame_id = planning_frame_;
-              servo_pub_->publish(zero_twist);
-
-              // 发布 JointJog，x/y/z 轴映射到对应的 3 个关节
-              const auto& joint_names = (new_mode == ControlMode::JOINT_GROUP_1)
-                                            ? JOINT_GROUP_1_NAMES
-                                            : JOINT_GROUP_2_NAMES;
-
-              double vel_x = applyJoyAxis(rx_copy.Arm_Pos_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vel_y = applyJoyAxis(rx_copy.Arm_Pos_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
-              double vel_z = applyJoyAxis(rx_copy.Arm_Pos_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
-
-              control_msgs::msg::JointJog jog;
-              jog.header.stamp    = now();
-              jog.header.frame_id = planning_frame_;
-              jog.joint_names     = {joint_names[0], joint_names[1], joint_names[2]};
-              jog.velocities      = {vel_x, vel_y, vel_z};
-              joint_jog_pub_->publish(jog);
-            }
-            // HOMING 模式：不发任何 servo 指令，由 MoveGroupInterface 控制
-          }
-        }
+        homing_active_ = true;
+        triggerHoming();
       }
     }
+
+    if (new_mode == ControlMode::CARTESIAN)
+    {
+      double vx = applyJoyAxis(arm_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      double vy = applyJoyAxis(arm_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      double vz = applyJoyAxis(arm_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      double v_roll  = applyJoyAxis(arm_roll,  joy_deadzone_angular_, 100, joy_max_angular_);
+      double v_pitch = applyJoyAxis(arm_pitch, joy_deadzone_angular_, 100, joy_max_angular_);
+
+      double q_dot[6] = {vy, 0.0, 0.0, v_roll, v_pitch, 0.0};
+
+      if (jacobian_ready_ && robot_state_ready_.load() &&
+          (vx != 0.0 || vz != 0.0))
+      {
+        Eigen::MatrixXd J;
+        double yaw = 0.0;
+        {
+          std::lock_guard<std::mutex> lock(robot_state_mutex_);
+          yaw = current_joint_pos_[0];
+          robot_state_->getJacobian(jmg_, jacobian_link_,
+                                    Eigen::Vector3d::Zero(), J);
+        }
+        Eigen::MatrixXd J_pitch(3, 2);
+        J_pitch.col(0) = J.block<3, 1>(0, 1);
+        J_pitch.col(1) = J.block<3, 1>(0, 2);
+
+        Eigen::Vector3d v_des(decouple_ee_max_ * vx * std::cos(yaw),
+                              decouple_ee_max_ * vx * std::sin(yaw),
+                              decouple_ee_max_ * vz);
+
+        Eigen::Vector2d q_pitch = dampedPinvSolve(J_pitch, v_des, 0.05);
+        q_dot[1] = std::clamp(q_pitch[0], -1.0, 1.0);
+        q_dot[2] = std::clamp(q_pitch[1], -1.0, 1.0);
+      }
+
+      geometry_msgs::msg::TwistStamped zero_twist;
+      zero_twist.header.stamp    = now();
+      zero_twist.header.frame_id = planning_frame_;
+      servo_pub_->publish(zero_twist);
+
+      control_msgs::msg::JointJog jog;
+      jog.header.stamp    = now();
+      jog.header.frame_id = planning_frame_;
+      jog.joint_names = {"1-joint", "2-joint", "3-joint",
+                         "4-joint", "5-joint", "6-joint"};
+      jog.velocities  = {q_dot[0], q_dot[1], q_dot[2],
+                         q_dot[3], q_dot[4], q_dot[5]};
+      joint_jog_pub_->publish(jog);
+    }
+    else if (new_mode == ControlMode::JOINT_GROUP_1 ||
+             new_mode == ControlMode::JOINT_GROUP_2)
+    {
+      geometry_msgs::msg::TwistStamped zero_twist;
+      zero_twist.header.stamp    = now();
+      zero_twist.header.frame_id = planning_frame_;
+      servo_pub_->publish(zero_twist);
+
+      const auto& joint_names = (new_mode == ControlMode::JOINT_GROUP_1)
+                                    ? JOINT_GROUP_1_NAMES
+                                    : JOINT_GROUP_2_NAMES;
+
+      double vel_x = applyJoyAxis(arm_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      double vel_y = applyJoyAxis(arm_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      double vel_z = applyJoyAxis(arm_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+
+      control_msgs::msg::JointJog jog;
+      jog.header.stamp    = now();
+      jog.header.frame_id = planning_frame_;
+      jog.joint_names     = {joint_names[0], joint_names[1], joint_names[2]};
+      jog.velocities      = {vel_x, vel_y, vel_z};
+      joint_jog_pub_->publish(jog);
+    }
+    // HOMING 模式：不发任何 servo 指令，由 MoveGroupInterface 控制
+  }
+
+  // ---- /joint_states 回调：更新 RobotState 供 Jacobian 使用 + TX 日志 ----
+  void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
+  {
+    std::unordered_map<std::string, double> pos_map;
+    pos_map.reserve(msg->name.size());
+    for (size_t i = 0; i < msg->name.size() && i < msg->position.size(); ++i)
+      pos_map[msg->name[i]] = msg->position[i];
+
+    const auto joint_names = get_parameter("joint_names").as_string_array();
+    if (static_cast<int>(joint_names.size()) < 6) return;
+
+    // state 日志：/joint_states 反馈的当前位置（非实际 TX，实际 TX 由 hw_interface 的 log_serial 输出）
+    if (send_log_)
+    {
+      int deg[6]{};
+      bool all_found = true;
+      for (int i = 0; i < 6; ++i)
+      {
+        auto it = pos_map.find(joint_names[i]);
+        if (it == pos_map.end()) { all_found = false; break; }
+        deg[i] = static_cast<int>((it->second - joint_offset_rad_[i]) * (180.0 / M_PI));
+      }
+      if (all_found)
+      {
+        RCLCPP_INFO(get_logger(),
+                    "STATE  deg: %d %d %d %d %d %d",
+                    deg[0], deg[1], deg[2], deg[3], deg[4], deg[5]);
+      }
+    }
+
+    if (!jacobian_ready_) return;
+
+    std::lock_guard<std::mutex> lock(robot_state_mutex_);
+    robot_state_->setVariablePositions(msg->name, msg->position);
+    robot_state_->update();
+    for (int i = 0; i < 6; ++i)
+    {
+      auto it = pos_map.find(joint_names[i]);
+      if (it != pos_map.end())
+        current_joint_pos_[i] = it->second;
+    }
+    robot_state_ready_ = true;
   }
 
   // ---- Servo start (runs in a detached thread) ----
-
   void callStartServo()
   {
-    // Use a temporary one-shot node for the service call so the main node's
-    // executor is not affected.
     auto tmp    = rclcpp::Node::make_shared("serial_comm_servo_starter");
     auto client = tmp->create_client<std_srvs::srv::Trigger>(START_SERVO_SERVICE);
 
     if (!client->wait_for_service(std::chrono::seconds(15)))
     {
-      RCLCPP_WARN(get_logger(),
-                  "servo_node 未运行");
+      RCLCPP_WARN(get_logger(), "servo_node 未运行");
       return;
     }
 
@@ -568,175 +399,22 @@ private:
 
     RCLCPP_INFO(get_logger(), "start_servo OK，等待 Servo 初始化…");
     std::this_thread::sleep_for(std::chrono::milliseconds(800));
-    RCLCPP_INFO(get_logger(), "Servo 控制就绪，开始接受下位机摇杆指令");
+    RCLCPP_INFO(get_logger(), "Servo 控制就绪，开始接受摇杆指令");
   }
-
-  // ---- serial_send topic callback ----
-
-  void sendCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
-  {
-    if (msg->data.size() < 6) return;
-
-    sendFromDoubles(msg->data.data());
-
-    RCLCPP_INFO(get_logger(),
-                "Send: Joint_1=%d, Joint_2=%d, Joint_3=%d, Joint_4=%d, Joint_5=%d, Joint_6=%d",
-                static_cast<int>(msg->data[0]), static_cast<int>(msg->data[1]),
-                static_cast<int>(msg->data[2]), static_cast<int>(msg->data[3]),
-                static_cast<int>(msg->data[4]), static_cast<int>(msg->data[5]));
-  }
-
-  // ---- /joint_states → serial TX ----
-
-  void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
-  {
-    // Build name→position map for O(1) lookup
-    std::unordered_map<std::string, double> pos_map;
-    pos_map.reserve(msg->name.size());
-    for (size_t i = 0; i < msg->name.size() && i < msg->position.size(); ++i)
-      pos_map[msg->name[i]] = msg->position[i];
-
-    const auto joint_names = get_parameter("joint_names").as_string_array();
-    if (static_cast<int>(joint_names.size()) < 6) return;
-
-    double angles[6];
-    for (int i = 0; i < 6; ++i)
-    {
-      auto it = pos_map.find(joint_names[i]);
-      if (it == pos_map.end()) return;  // 本帧不含全部关节，跳过
-      // ROS 弧度 → 下位机度数：先减去 ROS 零位偏移（即下位机零点对应的 ROS 弧度值），
-      // 得到以下位机零点为基准的弧度差，再转整数度。
-      angles[i] = (it->second - joint_offset_rad_[i]) * (180.0 / M_PI);
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(joint_tx_mutex_);
-      std::copy(angles, angles + 6, latest_joint_tx_);
-      joint_tx_ready_ = true;
-    }
-
-    // autoSendTimer already sends latest_joint_tx_ at send_rate_hz;
-    // sending here too would double TX traffic to the MCU.
-
-    // 更新 RobotState 供 Jacobian 退化使用
-    if (jacobian_ready_)
-    {
-      std::lock_guard<std::mutex> lock(robot_state_mutex_);
-      robot_state_->setVariablePositions(msg->name, msg->position);
-      robot_state_->update();
-      for (int i = 0; i < 6; ++i)
-      {
-        auto it = pos_map.find(joint_names[i]);
-        if (it != pos_map.end())
-          current_joint_pos_[i] = it->second;
-      }
-      robot_state_ready_ = true;
-    }
-  }
-
-  // ---- 方向切换检测 ----
-  bool directionChanged(double lx, double ly, double lz)
-  {
-    auto sgn = [](double v) -> int { return (v > 0.0) ? 1 : (v < 0.0) ? -1 : 0; };
-    int sx = sgn(lx), sy = sgn(ly), sz = sgn(lz);
-    bool changed = false;
-
-    // 摇杆回中
-    if (sx == 0 && sy == 0 && sz == 0 &&
-        (prev_sign_[0] || prev_sign_[1] || prev_sign_[2]))
-      changed = true;
-
-    // 任一轴反向
-    if ((prev_sign_[0] && sx && prev_sign_[0] != sx) ||
-        (prev_sign_[1] && sy && prev_sign_[1] != sy) ||
-        (prev_sign_[2] && sz && prev_sign_[2] != sz))
-      changed = true;
-
-    prev_sign_[0] = sx;
-    prev_sign_[1] = sy;
-    prev_sign_[2] = sz;
-    return changed;
-  }
-
-  // ---- Members ----
-
-  TRoMaC::Uart uart_;
-
-  std::thread       read_thread_;
-  std::atomic<bool> running_{false};
-
-  // 下位机电机零点在 ROS 坐标系下的弧度值 (initial_positions)
-  // 顺序：1-joint, 2-joint, 3-joint, 4-joint, 5-joint, 6-joint
-  static constexpr double joint_offset_rad_[6] = {
-    0.0,
-    0.0,
-    1.5708,
-    1.5447,
-    -1.5936,
-    0.3654
-  };
-
-  std::mutex                            rx_mutex_;
-  TRoMaC::VisionFrameRX_structTypedef   latest_rx_{};
-  uint64_t                              rx_count_{0};
-  std::chrono::steady_clock::time_point last_rx_time_{};
-
-  rclcpp::TimerBase::SharedPtr                                       send_timer_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr  send_sub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr     recv_pub_;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr      joint_state_sub_;
-
-  std::mutex joint_tx_mutex_;
-  double     latest_joint_tx_[6]{};
-  bool       joint_tx_ready_{false};
-
-  // ---- TX EMA 平滑状态 ----
-  double tx_smooth_alpha_{0.5};         // EMA 因子，参数 tx_smooth_alpha
-  double smoothed_tx_[6]{};             // 当前平滑后角度 (度)
-  bool   tx_smooth_initialized_{false}; // 首帧标志
-
-  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr     servo_pub_;
-  rclcpp::Publisher<control_msgs::msg::JointJog>::SharedPtr         joint_jog_pub_;
-  bool                                                               enable_servo_control_{false};
-  std::atomic<ControlMode>                                           control_mode_{ControlMode::CARTESIAN};
-
-  // Cached parameters (read once in ctor)
-  std::string  planning_frame_;
-  int16_t      joy_deadzone_xyz_{30};
-  int16_t      joy_deadzone_angular_{3};
-  double       joy_max_linear_{0.5};
-  double       joy_max_angular_{0.5};
-  double       decouple_ee_max_{0.3};
-  bool         log_auto_send_{false};
-
-  // ---- Jacobian 关节限位退化 ----
-  moveit::core::RobotModelPtr                     robot_model_;
-  std::shared_ptr<moveit::core::RobotState>       robot_state_;
-  const moveit::core::JointModelGroup*             jmg_{nullptr};
-  const moveit::core::LinkModel*                   jacobian_link_{nullptr};
-  std::mutex                                       robot_state_mutex_;
-  double                                           current_joint_pos_[6]{};
-  std::atomic<bool>                                robot_state_ready_{false};
-  bool                                             jacobian_ready_{false};
-  bool                                             fallback_active_{false};
-  bool                                             prev_fallback_active_{false};
-
-  struct JointLimitInfo { bool has_limits; double lower; double upper; };
-  JointLimitInfo joint_limits_[6]{};
-  static constexpr double LIMIT_MARGIN_RAD = 1.0 * M_PI / 180.0;  // 1°
-
-  int prev_sign_[3]{0, 0, 0};  // 方向追踪
 
   // ---- Homing (回初始位姿) ----
+  // 下位机电机零点在 ROS 坐标系下的弧度值
+  static constexpr double joint_offset_rad_[6] = {
+    0.0, 0.0, 1.5708, 1.5447, -1.5936, 0.3654
+  };
+
   std::atomic<bool> homing_active_{false};
 
   void triggerHoming()
   {
-    // 在独立线程中执行，避免阻塞 executor 或 readLoop
     std::thread(&SerialCommNode::executeHoming, this).detach();
   }
 
-  // 用临时 node 调用服务，避免 executor 死锁
   static bool callServiceViaTemp(const std::string& service_name,
                                  const rclcpp::Logger& logger)
   {
@@ -759,20 +437,16 @@ private:
   void executeHoming()
   {
     RCLCPP_INFO(get_logger(), "开始回初始位姿…");
-
     auto logger = get_logger();
 
-    // 1) 暂停 Servo
     callServiceViaTemp("/servo_node/pause_servo", logger);
 
     try
     {
-      // 用临时 node 创建 MoveGroupInterface，自带独立 executor，不死锁
       auto move_group_node = rclcpp::Node::make_shared(
           "homing_move_group_node",
           rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
 
-      // 设置 robot_description 参数（临时 node 需要这些来加载机器人模型）
       move_group_node->set_parameter(rclcpp::Parameter(
           "robot_description", get_parameter("robot_description").as_string()));
       move_group_node->set_parameter(rclcpp::Parameter(
@@ -785,8 +459,6 @@ private:
       move_group.setMaxAccelerationScalingFactor(1.0);
       move_group.setPlanningTime(1.0);
 
-      // 从主 node 的 robot_state_ 获取当前关节状态作为起始状态，
-      // 临时 node 的 getCurrentState 收不到 /joint_states（没有被 spin）
       if (jacobian_ready_ && robot_state_ready_.load())
       {
         std::lock_guard<std::mutex> lock(robot_state_mutex_);
@@ -794,7 +466,6 @@ private:
         move_group.setStartState(*robot_state_);
       }
 
-      // 目标 = initial_positions
       auto joint_names = get_parameter("joint_names").as_string_array();
       std::vector<double> target_joints(joint_offset_rad_, joint_offset_rad_ + 6);
       move_group.setJointValueTarget(joint_names, target_joints);
@@ -819,7 +490,6 @@ private:
       RCLCPP_ERROR(logger, "Homing 异常: %s", e.what());
     }
 
-    // 2) 重启 Servo（stop → start），清除内部旧状态
     callServiceViaTemp("/servo_node/stop_servo", logger);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     callServiceViaTemp("/servo_node/start_servo", logger);
@@ -829,6 +499,37 @@ private:
     control_mode_ = ControlMode::CARTESIAN;
     RCLCPP_INFO(logger, "Homing 完成，恢复笛卡尔 Servo");
   }
+
+  // ---- Members ----
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr recv_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr     joint_state_sub_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr     servo_pub_;
+  rclcpp::Publisher<control_msgs::msg::JointJog>::SharedPtr         joint_jog_pub_;
+
+  bool                     enable_servo_control_{false};
+  std::atomic<ControlMode> control_mode_{ControlMode::CARTESIAN};
+
+  std::string  planning_frame_;
+  int16_t      joy_deadzone_xyz_{30};
+  int16_t      joy_deadzone_angular_{3};
+  double       joy_max_linear_{0.5};
+  double       joy_max_angular_{0.5};
+  double       decouple_ee_max_{0.3};
+  bool         send_log_{false};
+
+  // ---- Jacobian 关节限位退化 ----
+  moveit::core::RobotModelPtr                     robot_model_;
+  std::shared_ptr<moveit::core::RobotState>       robot_state_;
+  const moveit::core::JointModelGroup*             jmg_{nullptr};
+  const moveit::core::LinkModel*                   jacobian_link_{nullptr};
+  std::mutex                                       robot_state_mutex_;
+  double                                           current_joint_pos_[6]{};
+  std::atomic<bool>                                robot_state_ready_{false};
+  bool                                             jacobian_ready_{false};
+
+  struct JointLimitInfo { bool has_limits; double lower; double upper; };
+  JointLimitInfo joint_limits_[6]{};
+  static constexpr double LIMIT_MARGIN_RAD = 1.0 * M_PI / 180.0;
 };
 
 int main(int argc, char** argv)

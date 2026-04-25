@@ -26,6 +26,9 @@
   <depend>sensor_msgs</depend>
   <depend>moveit_core</depend>
   <depend>moveit_ros_planning_interface</depend>
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp_lifecycle</depend>
 
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>moveit_ros_move_group</exec_depend>

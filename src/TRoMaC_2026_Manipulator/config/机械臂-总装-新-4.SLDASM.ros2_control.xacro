@@ -5,8 +5,10 @@
 
         <ros2_control name="${name}" type="system">
             <hardware>
-                <!-- By default, set up controllers for simulation. This won't work on real hardware -->
-                <plugin>mock_components/GenericSystem</plugin>
+                <plugin>tromac_hardware/TRoMaCHardwareInterface</plugin>
+                <param name="device">/dev/ttyUSB0</param>
+                <param name="baud_rate">921600</param>
+                <param name="log_serial">true</param>
             </hardware>
             <joint name="1-joint">
                 <command_interface name="position"/>

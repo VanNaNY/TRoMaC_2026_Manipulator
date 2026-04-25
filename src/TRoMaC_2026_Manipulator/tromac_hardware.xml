@@ -1,0 +1,10 @@
+<library path="tromac_hardware_interface">
+  <class name="tromac_hardware/TRoMaCHardwareInterface"
+         type="tromac_hardware::TRoMaCHardwareInterface"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      TRoMaC hardware interface: serial communication with lower computer MCU.
+      Reads Real_Joint angles from RX frames, writes command positions via TX frames.
+    </description>
+  </class>
+</library>

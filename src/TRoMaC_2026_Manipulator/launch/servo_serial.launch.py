@@ -52,14 +52,8 @@ def generate_launch_description():
         ],
     )
 
-    # Serial bridge: reads joystick from MCU over UART and drives MoveIt Servo.
-    # Axis mapping (base_link frame):
-    #   Arm_Pos_x/y/z   [-1000, 1000] → linear.x/y/z   (deadzone ±30,  max_output 0.5)
-    #   Arm_Pos_Roll/Pitch [-100, 100] → angular.x/y    (deadzone ±3,   max_output 0.5)
-    #   angular.z (Yaw) = 0
-    # Effective max velocity = joy_max * servo_settings scale (e.g. 0.5 × 0.20 = 0.10)
-    # RX joystick data → /servo_node/delta_twist_cmds (enable_servo_control=True)
-    # joint_states → serial TX: current joint angles sent back to MCU (enable_joint_state_tx=True)
+    # Servo controller: subscribes /serial_recv (from hardware interface) and drives MoveIt Servo.
+    # Serial communication (TX/RX) is handled by TRoMaCHardwareInterface (ros2_control plugin).
     serial_comm_node = Node(
         package=package_name,
         executable="serial_comm_node",
@@ -67,9 +61,6 @@ def generate_launch_description():
         output="screen",
         parameters=[
             {
-                "device":                LaunchConfiguration("serial_device"),
-                "baud_rate":             921600,
-                "auto_send":             True,
                 "enable_servo_control":  True,
                 "planning_frame":        "base_link",
                 "joy_deadzone_xyz":      30,
