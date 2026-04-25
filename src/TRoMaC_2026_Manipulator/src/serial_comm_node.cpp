@@ -194,7 +194,11 @@ private:
   void recvCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
   {
     // 数据格式: [x, y, z, pitch, roll, button, real_j1~j6]
-    if (msg->data.size() < 6) return;
+    if (msg->data.size() < 6) 
+    {
+      //RCLCPP_WARN(get_logger(), "没有下位机传值！检查遥控器是否连接正常！！");
+      return;
+    }
 
     int16_t arm_x     = static_cast<int16_t>(msg->data[0]);
     int16_t arm_y     = static_cast<int16_t>(msg->data[1]);
@@ -203,24 +207,22 @@ private:
     int16_t arm_roll  = static_cast<int16_t>(msg->data[4]);
     uint8_t button    = static_cast<uint8_t>(msg->data[5]);
 
+    //RCLCPP_INFO(get_logger(), "收到下位机传值！");
+
     if (send_log_)
     {
+      // serial_recv 中 real_joint 段为 0.01° 定点 raw 值，显示时还原为度
+      constexpr double kRawToDeg = 1.0 / 100.0;
       RCLCPP_INFO(get_logger(),
                   "RX: x=%d y=%d z=%d P=%d R=%d Btn=%u | "
-                  "Real_J: %d %d %d %d %d %d",
+                  "Real_J(deg): %.2f %.2f %.2f %.2f %.2f %.2f",
                   arm_x, arm_y, arm_z, arm_pitch, arm_roll, button,
-                  msg->data.size() >= 12
-                    ? static_cast<int>(msg->data[6])  : 0,
-                  msg->data.size() >= 12
-                    ? static_cast<int>(msg->data[7])  : 0,
-                  msg->data.size() >= 12
-                    ? static_cast<int>(msg->data[8])  : 0,
-                  msg->data.size() >= 12
-                    ? static_cast<int>(msg->data[9])  : 0,
-                  msg->data.size() >= 12
-                    ? static_cast<int>(msg->data[10]) : 0,
-                  msg->data.size() >= 12
-                    ? static_cast<int>(msg->data[11]) : 0);
+                  msg->data.size() >= 12 ? msg->data[6]  * kRawToDeg : 0.0,
+                  msg->data.size() >= 12 ? msg->data[7]  * kRawToDeg : 0.0,
+                  msg->data.size() >= 12 ? msg->data[8]  * kRawToDeg : 0.0,
+                  msg->data.size() >= 12 ? msg->data[9]  * kRawToDeg : 0.0,
+                  msg->data.size() >= 12 ? msg->data[10] * kRawToDeg : 0.0,
+                  msg->data.size() >= 12 ? msg->data[11] * kRawToDeg : 0.0);
     }
 
     if (!enable_servo_control_) return;
@@ -339,18 +341,18 @@ private:
     // state 日志：/joint_states 反馈的当前位置（非实际 TX，实际 TX 由 hw_interface 的 log_serial 输出）
     if (send_log_)
     {
-      int deg[6]{};
+      double deg[6]{};
       bool all_found = true;
       for (int i = 0; i < 6; ++i)
       {
         auto it = pos_map.find(joint_names[i]);
         if (it == pos_map.end()) { all_found = false; break; }
-        deg[i] = static_cast<int>((it->second - joint_offset_rad_[i]) * (180.0 / M_PI));
+        deg[i] = (it->second - joint_offset_rad_[i]) * (180.0 / M_PI);
       }
       if (all_found)
       {
         RCLCPP_INFO(get_logger(),
-                    "STATE  deg: %d %d %d %d %d %d",
+                    "STATE  deg: %.2f %.2f %.2f %.2f %.2f %.2f",
                     deg[0], deg[1], deg[2], deg[3], deg[4], deg[5]);
       }
     }

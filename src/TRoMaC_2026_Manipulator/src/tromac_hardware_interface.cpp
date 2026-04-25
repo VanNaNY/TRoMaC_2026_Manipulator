@@ -41,6 +41,15 @@ public:
     0.3654
   };
 
+  // 下位机 ↔ ROS 关节旋转方向系数
+  static constexpr double JOINT_DIR[6] = {
+    1.0, 1.0, -1.0, -1.0, 1.0, 1.0
+  };
+
+  // 串口收发使用 int16_t，但单位为 0.01° (定点)，避免整数度量化导致 MCU 死区
+  // 量程 ±327.67°，关节角不会越界
+  static constexpr double DEG_SCALE = 100.0;
+
   hardware_interface::CallbackReturn on_init(
     const hardware_interface::HardwareInfo & info) override
   {
@@ -65,6 +74,15 @@ public:
       log_serial_ = (val == "true" || val == "True" || val == "1");
     }
 
+    // 闭环同步周期（秒）：每隔这么久把 hw_positions_ 拉回到下位机真实位置；
+    // 设为 0 禁用同步（纯 open-loop）。中间周期保持 open-loop，避免 streaming
+    // 模式下 servo+JTC 因下位机响应延迟而 cmd 振荡
+    if (info_.hardware_parameters.count("closed_loop_sync_period_sec"))
+    {
+      sync_period_sec_ = std::stod(
+          info_.hardware_parameters.at("closed_loop_sync_period_sec"));
+    }
+
     // 初始化关节数据
     hw_positions_.resize(6, 0.0);
     hw_velocities_.resize(6, 0.0);
@@ -83,8 +101,11 @@ public:
     recv_pub_ = node_->create_publisher<std_msgs::msg::Float64MultiArray>("serial_recv", 10);
 
     RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"),
-                "on_init: device=%s, baud=%d, log_serial=%s",
-                device_.c_str(), baud_rate_, log_serial_ ? "true" : "false");
+                "on_init: device=%s, baud=%d, log_serial=%s, "
+                "closed_loop_sync_period=%.2fs%s",
+                device_.c_str(), baud_rate_, log_serial_ ? "true" : "false",
+                sync_period_sec_,
+                sync_period_sec_ > 0.0 ? "" : " (disabled, pure open-loop)");
 
     return hardware_interface::CallbackReturn::SUCCESS;
   }
@@ -112,7 +133,32 @@ public:
   hardware_interface::CallbackReturn on_activate(
     const rclcpp_lifecycle::State & /*previous_state*/) override
   {
-    RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"), "硬件接口已激活");
+    // open-loop 模式下 read() 不再回灌真实反馈，所以激活前必须把
+    // hw_commands_ 同步到下位机当前位置，否则控制器会用 OFFSET 作起点
+    // 把机械臂从任意位置一拍突跳到 home
+    auto logger = rclcpp::get_logger("TRoMaCHardwareInterface");
+    constexpr int kMaxRetry = 30;
+    for (int retry = 0; retry < kMaxRetry; ++retry)
+    {
+      {
+        std::lock_guard<std::mutex> lock(rx_mutex_);
+        if (rx_data_valid_)
+        {
+          for (int i = 0; i < 6; ++i)
+          {
+            hw_positions_[i] = rx_joint_rad_[i];
+            hw_commands_[i]  = rx_joint_rad_[i];
+          }
+          RCLCPP_INFO(logger,
+                      "硬件接口已激活，hw_commands_ 已同步到下位机真实位置");
+          return hardware_interface::CallbackReturn::SUCCESS;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    RCLCPP_WARN(logger,
+                "硬件接口已激活，但 3s 内未收到下位机 RX 数据，"
+                "hw_commands_ 仍为 OFFSET 初值——控制器启动可能导致大幅突跳");
     return hardware_interface::CallbackReturn::SUCCESS;
   }
 
@@ -168,32 +214,53 @@ public:
 
   // ros2_control update loop 调用 (100 Hz)
   hardware_interface::return_type read(
-    const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) override
+    const rclcpp::Time & time, const rclcpp::Duration & /*period*/) override
   {
-    // 从后台 RX 线程获取最新关节角度
-    std::lock_guard<std::mutex> lock(rx_mutex_);
-    if (rx_data_valid_)
+    // 默认 open-loop：把上一周期 hw_commands_ 当作反馈灌回 hw_positions_，
+    // 避免 servo + JTC 在 streaming 模式下因下位机响应延迟而 cmd 振荡。
+    // 但每隔 sync_period_sec_ 把 hw_positions_ 拉回真实编码器，做一次闭环
+    // 校正，让累计的 cmd↔actual 漂移不会无限放大
+    const int64_t now_ns    = time.nanoseconds();
+    const int64_t period_ns = static_cast<int64_t>(sync_period_sec_ * 1e9);
+    const bool sync_enabled = sync_period_sec_ > 0.0;
+    const bool need_sync    = sync_enabled &&
+                              (last_sync_ns_ == 0 ||
+                               now_ns - last_sync_ns_ >= period_ns);
+
+    if (need_sync)
     {
-      for (int i = 0; i < 6; ++i)
+      std::lock_guard<std::mutex> lock(rx_mutex_);
+      if (rx_data_valid_)
       {
-        // 下位机度数 → ROS 弧度：度转弧度 + 零位偏移
-        hw_positions_[i] = rx_joint_rad_[i];
+        for (int i = 0; i < 6; ++i)
+          hw_positions_[i] = rx_joint_rad_[i];
+        last_sync_ns_ = now_ns;
+        if (log_serial_)
+        {
+          RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"),
+                      "closed-loop sync: hw_positions_ ← rx_joint_rad_");
+        }
+        return hardware_interface::return_type::OK;
       }
+      // RX 暂时不可用，下个周期再试，本周期回退到 open-loop
     }
+
+    for (int i = 0; i < 6; ++i)
+      hw_positions_[i] = hw_commands_[i];
     return hardware_interface::return_type::OK;
   }
 
   hardware_interface::return_type write(
     const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) override
   {
-    // command position (ROS 弧度) → 减零位偏移 → 转下位机度数 → 串口 TX
+    // command position (ROS 弧度) → 减零位偏移 → 转下位机定点度数 → 串口 TX
     TRoMaC::VisionData vd{};
     int16_t joints[6];
-    //double degs[6];
+    double  degs[6];
     for (int i = 0; i < 6; ++i)
     {
-      double deg = (hw_commands_[i] - JOINT_OFFSET_RAD[i]) * (180.0 / M_PI); //degs[i]
-      joints[i] = static_cast<int16_t>(deg); //degs[i]
+      degs[i] = JOINT_DIR[i] * (hw_commands_[i] - JOINT_OFFSET_RAD[i]) * (180.0 / M_PI);
+      joints[i] = static_cast<int16_t>(std::lround(degs[i] * DEG_SCALE));
     }
     vd.Joint_1 = joints[0];
     vd.Joint_2 = joints[1];
@@ -206,15 +273,9 @@ public:
     if (log_serial_)
     {
       RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"),
-                  "TX: cmd_deg: %d %d %d %d %d %d",
-                  joints[0], joints[1], joints[2],
-                  joints[3], joints[4], joints[5]);
-      /*
-      RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"),
                   "TX: cmd_deg: %.2f %.2f %.2f %.2f %.2f %.2f",
                   degs[0], degs[1], degs[2],
                   degs[3], degs[4], degs[5]);
-      */
     }
 
     return hardware_interface::return_type::OK;
@@ -244,12 +305,13 @@ private:
           // 更新关节角度 (下位机度数 → ROS 弧度)
           {
             std::lock_guard<std::mutex> lock(rx_mutex_);
-            rx_joint_rad_[0] = static_cast<double>(rx.Real_Joint_1) * (M_PI / 180.0) + JOINT_OFFSET_RAD[0];
-            rx_joint_rad_[1] = static_cast<double>(rx.Real_Joint_2) * (M_PI / 180.0) + JOINT_OFFSET_RAD[1];
-            rx_joint_rad_[2] = static_cast<double>(rx.Real_Joint_3) * (M_PI / 180.0) + JOINT_OFFSET_RAD[2];
-            rx_joint_rad_[3] = static_cast<double>(rx.Real_Joint_4) * (M_PI / 180.0) + JOINT_OFFSET_RAD[3];
-            rx_joint_rad_[4] = static_cast<double>(rx.Real_Joint_5) * (M_PI / 180.0) + JOINT_OFFSET_RAD[4];
-            rx_joint_rad_[5] = static_cast<double>(rx.Real_Joint_6) * (M_PI / 180.0) + JOINT_OFFSET_RAD[5];
+            constexpr double RAW_TO_RAD = M_PI / 180.0 / DEG_SCALE;
+            rx_joint_rad_[0] = JOINT_DIR[0] * static_cast<double>(rx.Real_Joint_1) * RAW_TO_RAD + JOINT_OFFSET_RAD[0];
+            rx_joint_rad_[1] = JOINT_DIR[1] * static_cast<double>(rx.Real_Joint_2) * RAW_TO_RAD + JOINT_OFFSET_RAD[1];
+            rx_joint_rad_[2] = JOINT_DIR[2] * static_cast<double>(rx.Real_Joint_3) * RAW_TO_RAD + JOINT_OFFSET_RAD[2];
+            rx_joint_rad_[3] = JOINT_DIR[3] * static_cast<double>(rx.Real_Joint_4) * RAW_TO_RAD + JOINT_OFFSET_RAD[3];
+            rx_joint_rad_[4] = JOINT_DIR[4] * static_cast<double>(rx.Real_Joint_5) * RAW_TO_RAD + JOINT_OFFSET_RAD[4];
+            rx_joint_rad_[5] = JOINT_DIR[5] * static_cast<double>(rx.Real_Joint_6) * RAW_TO_RAD + JOINT_OFFSET_RAD[5];
             rx_data_valid_ = true;
           }
 
@@ -257,11 +319,12 @@ private:
           {
             RCLCPP_INFO(logger,
                         "RX  Joy: x=%d y=%d z=%d P=%d R=%d Btn=%u | "
-                        "Real_J: %d %d %d %d %d %d",
+                        "Real_J(deg): %.2f %.2f %.2f %.2f %.2f %.2f",
                         rx.Arm_Pos_x, rx.Arm_Pos_y, rx.Arm_Pos_z,
                         rx.Arm_Pos_Pitch, rx.Arm_Pos_Roll, rx.Button,
-                        rx.Real_Joint_1, rx.Real_Joint_2, rx.Real_Joint_3,
-                        rx.Real_Joint_4, rx.Real_Joint_5, rx.Real_Joint_6);
+                        rx.Real_Joint_1 / DEG_SCALE, rx.Real_Joint_2 / DEG_SCALE,
+                        rx.Real_Joint_3 / DEG_SCALE, rx.Real_Joint_4 / DEG_SCALE,
+                        rx.Real_Joint_5 / DEG_SCALE, rx.Real_Joint_6 / DEG_SCALE);
           }
 
           // 发布摇杆数据到 /serial_recv，供 serial_comm_node 订阅
@@ -291,6 +354,11 @@ private:
   std::string device_;
   int baud_rate_{921600};
   bool log_serial_{false};
+
+  // 闭环同步：hw_positions_ 默认 = hw_commands_ (open-loop)，每 sync_period_sec_
+  // 拉回 rx_joint_rad_ 一次。0 表示禁用周期同步（纯 open-loop）
+  double  sync_period_sec_{1.0};
+  int64_t last_sync_ns_{0};
 
   // 后台 RX 线程
   std::thread       read_thread_;
