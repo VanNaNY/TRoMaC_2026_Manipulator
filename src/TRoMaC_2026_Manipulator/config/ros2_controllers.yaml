@@ -1,7 +1,7 @@
 # This config file is used by ros2_control
 controller_manager:
   ros__parameters:
-    update_rate: 100  # Hz
+    update_rate: 200  # Hz
 
     manipulator_controller:
       type: joint_trajectory_controller/JointTrajectoryController
@@ -25,6 +25,12 @@ manipulator_controller:
       - position
       - velocity
     allow_nonzero_velocity_at_trajectory_end: true
+    # JTC 不读 hw_positions_ 作为插值起点，改用内部上次命令值。
+    # 否则 streaming servo + 闭环 hw 会让 JTC 每 cycle 从 actual 大幅插到 cmd target，引发抖动
+    open_loop_control: true
+    # 激活时用 hw_positions_(actual) 作初始状态，而非 hw_commands_(stale)。
+    # 配合 Btn=17 触发的 deactivate→activate 循环，把 cmd 链强制对齐到真实位置
+    set_last_command_interface_value_as_state_on_activation: false
     constraints:
       stopped_velocity_tolerance: 0.0
       goal_time: 0.0

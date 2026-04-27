@@ -11,6 +11,7 @@
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
 #include <pluginlib/class_list_macros.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 
 #include "Serial.h"
@@ -74,15 +75,6 @@ public:
       log_serial_ = (val == "true" || val == "True" || val == "1");
     }
 
-    // 闭环同步周期（秒）：每隔这么久把 hw_positions_ 拉回到下位机真实位置；
-    // 设为 0 禁用同步（纯 open-loop）。中间周期保持 open-loop，避免 streaming
-    // 模式下 servo+JTC 因下位机响应延迟而 cmd 振荡
-    if (info_.hardware_parameters.count("closed_loop_sync_period_sec"))
-    {
-      sync_period_sec_ = std::stod(
-          info_.hardware_parameters.at("closed_loop_sync_period_sec"));
-    }
-
     // 初始化关节数据
     hw_positions_.resize(6, 0.0);
     hw_velocities_.resize(6, 0.0);
@@ -95,17 +87,18 @@ public:
       hw_commands_[i]  = JOINT_OFFSET_RAD[i];
     }
 
-    // 创建内部 ROS node 用于发布摇杆数据
+    // 创建内部 ROS node 用于发布摇杆数据 + commanded joint states
     if (!rclcpp::ok()) rclcpp::init(0, nullptr);
     node_ = rclcpp::Node::make_shared("tromac_hw_iface_internal");
     recv_pub_ = node_->create_publisher<std_msgs::msg::Float64MultiArray>("serial_recv", 10);
+    // /commanded_joint_states：发的是 hw_commands_（servo 用作 "current state" 视图，
+    // 让 servo 内部 open-loop 累积 cmd，避免 MCU 慢响应导致 cmd 在原地振荡）
+    cmd_state_pub_ = node_->create_publisher<sensor_msgs::msg::JointState>(
+        "/commanded_joint_states", rclcpp::SystemDefaultsQoS());
 
     RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"),
-                "on_init: device=%s, baud=%d, log_serial=%s, "
-                "closed_loop_sync_period=%.2fs%s",
-                device_.c_str(), baud_rate_, log_serial_ ? "true" : "false",
-                sync_period_sec_,
-                sync_period_sec_ > 0.0 ? "" : " (disabled, pure open-loop)");
+                "on_init: device=%s, baud=%d, log_serial=%s (closed-loop)",
+                device_.c_str(), baud_rate_, log_serial_ ? "true" : "false");
 
     return hardware_interface::CallbackReturn::SUCCESS;
   }
@@ -133,9 +126,8 @@ public:
   hardware_interface::CallbackReturn on_activate(
     const rclcpp_lifecycle::State & /*previous_state*/) override
   {
-    // open-loop 模式下 read() 不再回灌真实反馈，所以激活前必须把
-    // hw_commands_ 同步到下位机当前位置，否则控制器会用 OFFSET 作起点
-    // 把机械臂从任意位置一拍突跳到 home
+    // 激活前必须把 hw_commands_ 同步到下位机当前位置，否则控制器会用 OFFSET
+    // 作起点，把机械臂从任意位置一拍突跳到 home
     auto logger = rclcpp::get_logger("TRoMaCHardwareInterface");
     constexpr int kMaxRetry = 30;
     for (int retry = 0; retry < kMaxRetry; ++retry)
@@ -214,45 +206,40 @@ public:
 
   // ros2_control update loop 调用 (100 Hz)
   hardware_interface::return_type read(
-    const rclcpp::Time & time, const rclcpp::Duration & /*period*/) override
+    const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) override
   {
-    // 默认 open-loop：把上一周期 hw_commands_ 当作反馈灌回 hw_positions_，
-    // 避免 servo + JTC 在 streaming 模式下因下位机响应延迟而 cmd 振荡。
-    // 但每隔 sync_period_sec_ 把 hw_positions_ 拉回真实编码器，做一次闭环
-    // 校正，让累计的 cmd↔actual 漂移不会无限放大
-    const int64_t now_ns    = time.nanoseconds();
-    const int64_t period_ns = static_cast<int64_t>(sync_period_sec_ * 1e9);
-    const bool sync_enabled = sync_period_sec_ > 0.0;
-    const bool need_sync    = sync_enabled &&
-                              (last_sync_ns_ == 0 ||
-                               now_ns - last_sync_ns_ >= period_ns);
-
-    if (need_sync)
+    // 标准闭环：永远把下位机真实编码器值灌给 hw_positions_。
+    // 若 RX 暂未到达，hw_positions_ 保留上一周期值（on_activate 已用首帧 RX 初始化）。
+    //
+    // hw_commands_ 同步到 hw_positions_：兜底 controller deactivate→activate 间隙
+    // （resync 期间 ~50ms）。配 open_loop_control:true，JTC active 时不读 hw_commands_，
+    // update() 会覆盖；force-sync 窗口内 write() 也会覆盖成 snapshot_pos_。
+    std::lock_guard<std::mutex> lock(rx_mutex_);
+    if (rx_data_valid_)
     {
-      std::lock_guard<std::mutex> lock(rx_mutex_);
-      if (rx_data_valid_)
+      for (int i = 0; i < 6; ++i)
       {
-        for (int i = 0; i < 6; ++i)
-          hw_positions_[i] = rx_joint_rad_[i];
-        last_sync_ns_ = now_ns;
-        if (log_serial_)
-        {
-          RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"),
-                      "closed-loop sync: hw_positions_ ← rx_joint_rad_");
-        }
-        return hardware_interface::return_type::OK;
+        hw_positions_[i] = rx_joint_rad_[i];
+        hw_commands_[i]  = rx_joint_rad_[i];
       }
-      // RX 暂时不可用，下个周期再试，本周期回退到 open-loop
     }
-
-    for (int i = 0; i < 6; ++i)
-      hw_positions_[i] = hw_commands_[i];
     return hardware_interface::return_type::OK;
   }
 
   hardware_interface::return_type write(
     const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) override
   {
+    // force-sync 窗口：TX 恒等于 Btn=17 那一刻抓拍的 snapshot_pos_，不跟 RX 漂移。
+    // 避免「RX 抖动 → TX 跟随 → MCU 跟随 → encoder 跟随 → RX 进一步漂移」的正反馈环。
+    // serial_comm_node 在 ~800ms 后做 JTC restart，那时 MCU 已稳在 snapshot 上，JTC
+    // 内部 last_commanded 锁定到此值；窗口结束后无缝交接，TX 不阶跃。
+    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (now_ns < force_sync_until_ns_.load(std::memory_order_acquire))
+    {
+      for (int i = 0; i < 6; ++i)
+        hw_commands_[i] = snapshot_pos_[i];
+    }
+
     // command position (ROS 弧度) → 减零位偏移 → 转下位机定点度数 → 串口 TX
     TRoMaC::VisionData vd{};
     int16_t joints[6];
@@ -269,6 +256,21 @@ public:
     vd.Joint_5 = joints[4];
     vd.Joint_6 = joints[5];
     uart_.send(vd);
+
+    // 发布 commanded joint state，供 servo 作为 "current state" 使用
+    // 这样 servo 不读 RX 反馈，target = last_cmd + Δ 会持续累积，
+    // TX 不再在原地振荡，下位机能收到稳定推进的指令
+    sensor_msgs::msg::JointState cmd_msg;
+    cmd_msg.header.stamp = node_->now();
+    cmd_msg.name.reserve(info_.joints.size());
+    cmd_msg.position.reserve(info_.joints.size());
+    cmd_msg.velocity.assign(info_.joints.size(), 0.0);
+    for (size_t i = 0; i < info_.joints.size(); ++i)
+    {
+      cmd_msg.name.push_back(info_.joints[i].name);
+      cmd_msg.position.push_back(hw_commands_[i]);
+    }
+    cmd_state_pub_->publish(cmd_msg);
 
     if (log_serial_)
     {
@@ -303,6 +305,7 @@ private:
           TRoMaC::VisionFrameRX_structTypedef rx = uart_.read_data;
 
           // 更新关节角度 (下位机度数 → ROS 弧度)
+          const bool button_rising = (rx.Button == 17 && prev_button_ != 17);
           {
             std::lock_guard<std::mutex> lock(rx_mutex_);
             constexpr double RAW_TO_RAD = M_PI / 180.0 / DEG_SCALE;
@@ -313,7 +316,33 @@ private:
             rx_joint_rad_[4] = JOINT_DIR[4] * static_cast<double>(rx.Real_Joint_5) * RAW_TO_RAD + JOINT_OFFSET_RAD[4];
             rx_joint_rad_[5] = JOINT_DIR[5] * static_cast<double>(rx.Real_Joint_6) * RAW_TO_RAD + JOINT_OFFSET_RAD[5];
             rx_data_valid_ = true;
+
+            // Btn=17 上升沿：抓拍当前 actual 作为 snapshot。force-sync 窗口里 TX
+            // 恒等于此 snapshot（不跟 RX），让 MCU 看到稳定 cmd 就地不动。
+            if (button_rising)
+            {
+              for (int i = 0; i < 6; ++i)
+                snapshot_pos_[i] = rx_joint_rad_[i];
+            }
           }
+
+          // Btn=17 上升沿：启动 1.2s force-sync 窗口。release 语义保证 snapshot_pos_
+          // 写入对 write() 的 acquire load 可见。1.2s = 800ms 等 MCU 稳定 + ~200ms
+          // serial_comm_node 走 JTC restart + 200ms 缓冲。
+          if (button_rising)
+          {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(1200);
+            force_sync_until_ns_.store(
+                deadline.time_since_epoch().count(),
+                std::memory_order_release);
+            RCLCPP_INFO(logger,
+                        "Btn=17 上升沿，snapshot=[%.3f %.3f %.3f %.3f %.3f %.3f] rad，"
+                        "启动 1.2s force-sync 窗口",
+                        snapshot_pos_[0], snapshot_pos_[1], snapshot_pos_[2],
+                        snapshot_pos_[3], snapshot_pos_[4], snapshot_pos_[5]);
+          }
+          prev_button_ = rx.Button;
 
           if (log_serial_)
           {
@@ -355,11 +384,6 @@ private:
   int baud_rate_{921600};
   bool log_serial_{false};
 
-  // 闭环同步：hw_positions_ 默认 = hw_commands_ (open-loop)，每 sync_period_sec_
-  // 拉回 rx_joint_rad_ 一次。0 表示禁用周期同步（纯 open-loop）
-  double  sync_period_sec_{1.0};
-  int64_t last_sync_ns_{0};
-
   // 后台 RX 线程
   std::thread       read_thread_;
   std::atomic<bool> running_{false};
@@ -369,14 +393,27 @@ private:
   double     rx_joint_rad_[6]{};
   bool       rx_data_valid_{false};
 
+  // Btn=17 检测（仅 readLoop 单线程访问，无需原子）
+  uint8_t prev_button_{0};
+
+  // Btn=17 抓拍位置（rad）：写=readLoop（上升沿），读=write()。
+  // 同步靠 force_sync_until_ns_ 的 release-acquire 提供 happens-before；
+  // write() 只在 force_sync_until_ns_ 还在未来才会读，此时 snapshot 已稳定写入。
+  double snapshot_pos_[6]{};
+
+  // force-sync 窗口截止时间（steady_clock ns since epoch）。窗口内 write() 强制
+  // hw_commands_ = snapshot_pos_，覆盖 JTC 输出，避免 RX 抖动正反馈。
+  std::atomic<int64_t> force_sync_until_ns_{0};
+
   // ros2_control 接口数据
   std::vector<double> hw_positions_;
   std::vector<double> hw_velocities_;
   std::vector<double> hw_commands_;
 
-  // 内部 ROS node（用于发布摇杆 topic）
+  // 内部 ROS node（用于发布摇杆 topic + commanded joint states）
   rclcpp::Node::SharedPtr node_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr recv_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr cmd_state_pub_;
 };
 
 }  // namespace tromac_hardware

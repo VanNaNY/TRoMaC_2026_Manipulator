@@ -11,6 +11,7 @@
 #include <control_msgs/msg/joint_jog.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <controller_manager_msgs/srv/switch_controller.hpp>
 
 #include <moveit/robot_model/robot_model.h>
 #include <moveit/robot_state/robot_state.h>
@@ -206,6 +207,21 @@ private:
     int16_t arm_pitch = static_cast<int16_t>(msg->data[3]);
     int16_t arm_roll  = static_cast<int16_t>(msg->data[4]);
     uint8_t button    = static_cast<uint8_t>(msg->data[5]);
+
+    // Btn=17 上升沿 → 延迟 800ms 后触发 JTC 重启同步。
+    // hw_interface 在 Btn=17 那一刻已抓拍 snapshot 并启动 1.2s force-sync 窗口
+    // （TX 恒等于 snapshot），800ms 后 MCU 已稳在 snapshot 上，此时 resync 让 JTC
+    // 内部 last_commanded 锁定到 hw_positions_ ≈ snapshot；force-sync 1.2s 结束
+    // 后 JTC 接管，cmd 与 force-sync 输出一致，无阶跃。
+    if (button == 17 && last_button_ != 17)
+    {
+      RCLCPP_INFO(get_logger(), "检测到 Btn=17 上升沿，800ms 后触发 JTC 重启同步");
+      std::thread([this]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        this->resyncControllerToActual();
+      }).detach();
+    }
+    last_button_ = button;
 
     //RCLCPP_INFO(get_logger(), "收到下位机传值！");
 
@@ -436,6 +452,74 @@ private:
     return false;
   }
 
+  // deactivate→activate manipulator_controller，让 JTC 用 hw_positions_ 做新起点。
+  // 配合 ros2_controllers.yaml 里的 set_last_command_interface_value_as_state_on_activation:false
+  // 实现 cmd 链对齐到真实 RX 位置。
+  // 必须拆成两次独立调用——controller_manager 预检查整个请求，发现
+  // controller 当前状态与请求冲突就直接 abort（同一次请求里 deactivate+activate
+  // 同一个 controller 不会被模拟成顺序执行）
+  //
+  // Servo 也要走 stop→start：手动掰期间 servo 看到的 /commanded_joint_states 一直是旧 cmd，
+  // 它的内部 smoothing filter 和"持守目标"卡在那个值上。如果只重启 JTC，servo 恢复发轨迹
+  // 时 target 还是旧 cmd，会把刚对齐好的 JTC 又拉回去（实测 ~15ms 后 snap 回 0）。
+  // stop_servo 会停止发布；start_servo 触发完整初始化，从最新 joint_topic 重采样。
+  void resyncControllerToActual()
+  {
+    using SwitchController = controller_manager_msgs::srv::SwitchController;
+    auto logger = get_logger();
+    constexpr const char* kCtrl = "manipulator_controller";
+
+    auto tmp = rclcpp::Node::make_shared("resync_service_caller");
+    auto client = tmp->create_client<SwitchController>(
+        "/controller_manager/switch_controller");
+    if (!client->wait_for_service(std::chrono::seconds(2)))
+    {
+      RCLCPP_WARN(logger, "/controller_manager/switch_controller 不可用，跳过同步");
+      return;
+    }
+
+    auto call_switch = [&](const std::vector<std::string>& deact,
+                           const std::vector<std::string>& act,
+                           const char* tag) -> bool {
+      auto req = std::make_shared<SwitchController::Request>();
+      req->deactivate_controllers = deact;
+      req->activate_controllers   = act;
+      req->strictness             = SwitchController::Request::STRICT;
+      req->activate_asap          = true;
+
+      auto future = client->async_send_request(req);
+      if (rclcpp::spin_until_future_complete(tmp, future, std::chrono::seconds(3)) !=
+          rclcpp::FutureReturnCode::SUCCESS)
+      {
+        RCLCPP_WARN(logger, "%s 调用超时", tag);
+        return false;
+      }
+      if (!future.get()->ok)
+      {
+        RCLCPP_WARN(logger, "%s 失败 (controller_manager 拒绝)", tag);
+        return false;
+      }
+      return true;
+    };
+
+    // 1. 先停 servo，避免其继续往 JTC 发 target=旧cmd 的轨迹
+    callServiceViaTemp("/servo_node/stop_servo", logger);
+
+    // 2. JTC 走 deactivate→activate，对齐 last_commanded 到 hw_positions_
+    if (!call_switch({kCtrl}, {}, "deactivate")) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!call_switch({}, {kCtrl}, "activate")) return;
+
+    // 3. 等 JTC 至少跑一拍，把对齐后的 hw_commands_ 发布到 /commanded_joint_states，
+    //    这样下一步 start_servo 重采样时能看到正确的当前状态
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // 4. 重启 servo：内部 filter 复位，从最新 joint_topic 采样作为持守目标
+    callServiceViaTemp("/servo_node/start_servo", logger);
+
+    RCLCPP_INFO(logger, "JTC + Servo 重启完成，cmd 已对齐到真实位置");
+  }
+
   void executeHoming()
   {
     RCLCPP_INFO(get_logger(), "开始回初始位姿…");
@@ -457,8 +541,8 @@ private:
       auto move_group = moveit::planning_interface::MoveGroupInterface(
           move_group_node, "manipulator");
 
-      move_group.setMaxVelocityScalingFactor(1.0);
-      move_group.setMaxAccelerationScalingFactor(1.0);
+      move_group.setMaxVelocityScalingFactor(0.5);
+      move_group.setMaxAccelerationScalingFactor(0.5);
       move_group.setPlanningTime(1.0);
 
       if (jacobian_ready_ && robot_state_ready_.load())
@@ -510,6 +594,9 @@ private:
 
   bool                     enable_servo_control_{false};
   std::atomic<ControlMode> control_mode_{ControlMode::CARTESIAN};
+
+  // Btn=17 上升沿检测（与下位机 Btn 码一致）
+  uint8_t last_button_{0};
 
   std::string  planning_frame_;
   int16_t      joy_deadzone_xyz_{30};
