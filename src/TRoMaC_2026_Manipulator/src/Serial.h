@@ -113,6 +113,10 @@ namespace TRoMaC
         VisionFrameRX_structTypedef read_data;
         VisionFrameTX_unionTypeDef TXunion;
 
+        // ReadData 检测到 read()<=0（设备掉线）时置 true；Open() 入口清零。
+        // 上层 readLoop 在 ReadData 返回 false 后检查此标志判断是断开还是单纯没数据。
+        bool last_read_disconnected_ = false;
+
     private:
         // RX 状态机
         enum class RxState { WAIT_HEADER, READ_PAYLOAD, WAIT_TAIL };

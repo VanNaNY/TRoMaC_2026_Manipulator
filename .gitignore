@@ -18,6 +18,10 @@ CMakeFiles/
 # Node (local tooling; never commit dependencies)
 node_modules/
 
+# Archives / mesh backups（体积大或仅本地备份，不纳入版本库）
+*.zip
+*_Old.STL
+
 # IDE / OS
 .idea/
 .vscode/

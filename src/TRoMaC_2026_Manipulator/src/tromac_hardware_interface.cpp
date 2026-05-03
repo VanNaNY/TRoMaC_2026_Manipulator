@@ -32,14 +32,18 @@ namespace tromac_hardware
 class TRoMaCHardwareInterface : public hardware_interface::SystemInterface
 {
 public:
-  // 下位机电机零点在 ROS 坐标系下的弧度值 (与 initial_positions.yaml 一致)
+  // 下位机电机零点在 ROS 坐标系下的弧度值。
+  // 关系: ros_rad = JOINT_DIR * raw_deg * π/180 + JOINT_OFFSET_RAD
+  // 含义: 当下位机报告 raw=0（MCU 自身零点）时，ROS 看到的关节弧度。
+  // J1 的 ROS 零点被人为后移 124.417145° —— 即把"下位机 +124.417145°"位置定义为 ROS 0。
+  // 因此 OFFSET[0] = -124.417145° × π/180 = -2.17148883 rad（MCU-zero 在 ROS 里读 -2.17148883）。
   static constexpr double JOINT_OFFSET_RAD[6] = {
+    -2.17148883, 
     0.0,
-    0.0,
-    1.5708,
-    1.5447,
-    -1.5936,
-    0.3654
+    1.7008,
+    1.8447,
+    -1.4336,
+    1.8708
   };
 
   // 下位机 ↔ ROS 关节旋转方向系数
@@ -68,7 +72,6 @@ public:
                      ? std::stoi(info_.hardware_parameters.at("baud_rate"))
                      : 921600;
 
-    // 日志开关（xacro <param name="log_serial">true</param>）
     if (info_.hardware_parameters.count("log_serial"))
     {
       const auto& val = info_.hardware_parameters.at("log_serial");
@@ -106,15 +109,22 @@ public:
   hardware_interface::CallbackReturn on_configure(
     const rclcpp_lifecycle::State & /*previous_state*/) override
   {
-    // 打开串口
-    if (!uart_.Open(device_, baud_rate_))
+    auto logger = rclcpp::get_logger("TRoMaCHardwareInterface");
+
+    // 启动时尝试一次 Open；失败也不再返回 ERROR——把控制权交给 readLoop 的重连循环，
+    // 这样下位机暂未上电也能 launch 起来，连上后自动进入工作状态
+    if (uart_.Open(device_, baud_rate_))
     {
-      RCLCPP_FATAL(rclcpp::get_logger("TRoMaCHardwareInterface"),
-                   "无法打开串口: %s @ %d", device_.c_str(), baud_rate_);
-      return hardware_interface::CallbackReturn::ERROR;
+      serial_connected_.store(true, std::memory_order_release);
+      RCLCPP_INFO(logger, "串口已打开: %s @ %d baud", device_.c_str(), baud_rate_);
     }
-    RCLCPP_INFO(rclcpp::get_logger("TRoMaCHardwareInterface"),
-                "串口已打开: %s @ %d baud", device_.c_str(), baud_rate_);
+    else
+    {
+      serial_connected_.store(false, std::memory_order_release);
+      RCLCPP_WARN(logger,
+                  "首次打开串口失败: %s @ %d，readLoop 将每 1s 自动重连",
+                  device_.c_str(), baud_rate_);
+    }
 
     // 启动后台 RX 线程
     running_ = true;
@@ -255,7 +265,25 @@ public:
     vd.Joint_4 = joints[3];
     vd.Joint_5 = joints[4];
     vd.Joint_6 = joints[5];
-    uart_.send(vd);
+
+    // 串口未连接时静默丢弃 TX，5s 节流告警一次
+    if (serial_connected_.load(std::memory_order_acquire))
+    {
+      uart_.send(vd);
+    }
+    else
+    {
+      ++dropped_tx_count_;
+      auto now_tp = std::chrono::steady_clock::now();
+      if (now_tp - last_tx_warn_ >= std::chrono::seconds(5))
+      {
+        RCLCPP_WARN(rclcpp::get_logger("TRoMaCHardwareInterface"),
+                    "串口未连接，最近 5s 丢弃 %lu 帧 TX",
+                    static_cast<unsigned long>(dropped_tx_count_));
+        dropped_tx_count_ = 0;
+        last_tx_warn_     = now_tp;
+      }
+    }
 
     // 发布 commanded joint state，供 servo 作为 "current state" 使用
     // 这样 servo 不读 RX 反馈，target = last_cmd + Δ 会持续累积，
@@ -284,97 +312,231 @@ public:
   }
 
 private:
-  // 后台线程：持续从串口读取 RX 帧
+  // 处理一帧已解析好的 RX 数据：更新 rx_joint_rad_、Btn=17 同步逻辑、发布 /serial_recv。
+  // 抽出来是为了让正常 readLoop 和 onReconnectedTriggerSync 共享同一份解析换算逻辑。
+  void handleRxFrame(const TRoMaC::VisionFrameRX_structTypedef& rx,
+                     const rclcpp::Logger& logger)
+  {
+    const bool button_rising = (rx.Button == 17 && prev_button_ != 17);
+    {
+      std::lock_guard<std::mutex> lock(rx_mutex_);
+      constexpr double RAW_TO_RAD = M_PI / 180.0 / DEG_SCALE;
+      rx_joint_rad_[0] = JOINT_DIR[0] * static_cast<double>(rx.Real_Joint_1) * RAW_TO_RAD + JOINT_OFFSET_RAD[0];
+      rx_joint_rad_[1] = JOINT_DIR[1] * static_cast<double>(rx.Real_Joint_2) * RAW_TO_RAD + JOINT_OFFSET_RAD[1];
+      rx_joint_rad_[2] = JOINT_DIR[2] * static_cast<double>(rx.Real_Joint_3) * RAW_TO_RAD + JOINT_OFFSET_RAD[2];
+      rx_joint_rad_[3] = JOINT_DIR[3] * static_cast<double>(rx.Real_Joint_4) * RAW_TO_RAD + JOINT_OFFSET_RAD[3];
+      rx_joint_rad_[4] = JOINT_DIR[4] * static_cast<double>(rx.Real_Joint_5) * RAW_TO_RAD + JOINT_OFFSET_RAD[4];
+      rx_joint_rad_[5] = JOINT_DIR[5] * static_cast<double>(rx.Real_Joint_6) * RAW_TO_RAD + JOINT_OFFSET_RAD[5];
+      rx_data_valid_ = true;
+
+      if (button_rising)
+      {
+        for (int i = 0; i < 6; ++i)
+          snapshot_pos_[i] = rx_joint_rad_[i];
+      }
+    }
+
+    if (button_rising)
+    {
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(1200);
+      force_sync_until_ns_.store(
+          deadline.time_since_epoch().count(),
+          std::memory_order_release);
+      RCLCPP_INFO(logger,
+                  "Btn=17 上升沿，snapshot=[%.3f %.3f %.3f %.3f %.3f %.3f] rad，"
+                  "启动 1.2s force-sync 窗口",
+                  snapshot_pos_[0], snapshot_pos_[1], snapshot_pos_[2],
+                  snapshot_pos_[3], snapshot_pos_[4], snapshot_pos_[5]);
+    }
+    prev_button_ = rx.Button;
+
+    if (log_serial_)
+    {
+      RCLCPP_INFO(logger,
+                  "RX  Joy: x=%d y=%d z=%d P=%d R=%d Btn=%u | "
+                  "Real_J(deg): %.2f %.2f %.2f %.2f %.2f %.2f",
+                  rx.Arm_Pos_x, rx.Arm_Pos_y, rx.Arm_Pos_z,
+                  rx.Arm_Pos_Pitch, rx.Arm_Pos_Roll, rx.Button,
+                  rx.Real_Joint_1 / DEG_SCALE, rx.Real_Joint_2 / DEG_SCALE,
+                  rx.Real_Joint_3 / DEG_SCALE, rx.Real_Joint_4 / DEG_SCALE,
+                  rx.Real_Joint_5 / DEG_SCALE, rx.Real_Joint_6 / DEG_SCALE);
+    }
+
+    std_msgs::msg::Float64MultiArray msg;
+    msg.data = {
+      static_cast<double>(rx.Arm_Pos_x),
+      static_cast<double>(rx.Arm_Pos_y),
+      static_cast<double>(rx.Arm_Pos_z),
+      static_cast<double>(rx.Arm_Pos_Pitch),
+      static_cast<double>(rx.Arm_Pos_Roll),
+      static_cast<double>(rx.Button),
+      static_cast<double>(rx.Real_Joint_1),
+      static_cast<double>(rx.Real_Joint_2),
+      static_cast<double>(rx.Real_Joint_3),
+      static_cast<double>(rx.Real_Joint_4),
+      static_cast<double>(rx.Real_Joint_5),
+      static_cast<double>(rx.Real_Joint_6)
+    };
+    recv_pub_->publish(msg);
+  }
+
+  // 阻塞等待重连，直到成功或 running_=false。每 1s 尝试一次，每 5s 打 INFO。
+  void attemptReconnect(const rclcpp::Logger& logger)
+  {
+    using namespace std::chrono;
+    auto last_info = steady_clock::now() - seconds(5);
+    uint32_t attempts = 0;
+
+    while (running_.load())
+    {
+      if (steady_clock::now() - last_info >= seconds(5))
+      {
+        RCLCPP_INFO(logger, "尝试重连 %s @ %d…（已尝试 %u 次）",
+                    device_.c_str(), baud_rate_, attempts);
+        last_info = steady_clock::now();
+      }
+      if (uart_.Open(device_, baud_rate_))
+      {
+        RCLCPP_INFO(logger, "串口重连成功（共尝试 %u 次）", attempts + 1);
+        serial_connected_.store(true, std::memory_order_release);
+        return;
+      }
+      ++attempts;
+      std::this_thread::sleep_for(seconds(1));
+    }
+  }
+
+  // 重连成功后模拟一次 Btn=17 上升沿，让 cmd 链对齐到下位机真实位置。
+  // 等首帧 RX → 抓 snapshot → 启 force-sync 窗口 → 合成 0→17 RX 让
+  // serial_comm_node 触发 JTC+Servo 重启。
+  void onReconnectedTriggerSync(const rclcpp::Logger& logger)
+  {
+    using namespace std::chrono;
+
+    auto deadline = steady_clock::now() + seconds(3);
+    bool got_frame = false;
+    TRoMaC::VisionFrameRX_structTypedef first_rx{};
+
+    while (running_.load() && steady_clock::now() < deadline && !got_frame)
+    {
+      fd_set fds; FD_ZERO(&fds); FD_SET(uart_.serial_id, &fds);
+      struct timeval tv{0, 200000};
+      int ret = select(uart_.serial_id + 1, &fds, nullptr, nullptr, &tv);
+      if (ret > 0 && FD_ISSET(uart_.serial_id, &fds))
+      {
+        while (uart_.ReadData())
+        {
+          first_rx  = uart_.read_data;
+          got_frame = true;
+          break;
+        }
+        if (uart_.last_read_disconnected_)
+        {
+          RCLCPP_WARN(logger, "重连后立刻又掉了，回到重连循环");
+          serial_connected_.store(false, std::memory_order_release);
+          uart_.Close();
+          return;
+        }
+      }
+      else if (ret < 0)
+      {
+        RCLCPP_WARN(logger, "重连后 select 出错，回到重连循环");
+        serial_connected_.store(false, std::memory_order_release);
+        uart_.Close();
+        return;
+      }
+    }
+
+    if (!got_frame)
+    {
+      RCLCPP_WARN(logger,
+                  "重连成功但 3s 内未收到 RX，跳过同步（cmd 链可能突跳）");
+      return;
+    }
+
+    // 1. 解析首帧并写 rx_joint_rad_/snapshot_pos_/启 force-sync 窗口。
+    //    走 handleRxFrame 时强制 Button=17 制造上升沿，让内部 prev_button_=17，
+    //    snapshot 抓的是首帧实际位置。
+    TRoMaC::VisionFrameRX_structTypedef rx_for_sync = first_rx;
+    rx_for_sync.Button = 17;
+    prev_button_ = 0;  // 强制让 handleRxFrame 检测到 0→17 上升沿
+
+    // 先发一帧 Button=0 的合成消息，把 serial_comm_node 的 last_button_ 拉到 0
+    //（断开瞬间用户可能正按住 Btn=17，serial_comm_node 那边的 last_button_ 还是 17）
+    {
+      std_msgs::msg::Float64MultiArray msg;
+      msg.data = {
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        static_cast<double>(first_rx.Real_Joint_1),
+        static_cast<double>(first_rx.Real_Joint_2),
+        static_cast<double>(first_rx.Real_Joint_3),
+        static_cast<double>(first_rx.Real_Joint_4),
+        static_cast<double>(first_rx.Real_Joint_5),
+        static_cast<double>(first_rx.Real_Joint_6)
+      };
+      recv_pub_->publish(msg);
+    }
+    std::this_thread::sleep_for(milliseconds(20));  // 让 recvCallback 处理一拍
+
+    // 2. handleRxFrame：抓 snapshot、启 1.2s force-sync 窗口、发一条带 Btn=17 的 /serial_recv
+    handleRxFrame(rx_for_sync, logger);
+
+    RCLCPP_INFO(logger,
+                "重连同步：snapshot=[%.3f %.3f %.3f %.3f %.3f %.3f] rad，"
+                "force-sync 1.2s + JTC restart 已触发",
+                snapshot_pos_[0], snapshot_pos_[1], snapshot_pos_[2],
+                snapshot_pos_[3], snapshot_pos_[4], snapshot_pos_[5]);
+  }
+
+  // 后台线程：持续从串口读取 RX 帧；断开自动重连，重连后自动模拟 Btn=17 同步
   void readLoop()
   {
     auto logger = rclcpp::get_logger("TRoMaCHardwareInterface");
+
     while (running_.load())
     {
+      // ── 阶段 1：保证已连接 ──
+      if (!serial_connected_.load(std::memory_order_acquire))
+      {
+        attemptReconnect(logger);
+        if (!running_.load()) break;
+        onReconnectedTriggerSync(logger);
+        // 同步流程内部可能因为又掉线而把 connected 置 false，下一轮 while 会再进重连
+        continue;
+      }
+
+      // ── 阶段 2：正常 select+ReadData ──
       fd_set fds;
       FD_ZERO(&fds);
       FD_SET(uart_.serial_id, &fds);
       struct timeval tv{};
       tv.tv_sec  = 0;
-      tv.tv_usec = 300000;  // 300 ms timeout
+      tv.tv_usec = 300000;
 
       int ret = select(uart_.serial_id + 1, &fds, nullptr, nullptr, &tv);
       if (ret > 0 && FD_ISSET(uart_.serial_id, &fds))
       {
         while (running_.load() && uart_.ReadData())
         {
-          TRoMaC::VisionFrameRX_structTypedef rx = uart_.read_data;
-
-          // 更新关节角度 (下位机度数 → ROS 弧度)
-          const bool button_rising = (rx.Button == 17 && prev_button_ != 17);
-          {
-            std::lock_guard<std::mutex> lock(rx_mutex_);
-            constexpr double RAW_TO_RAD = M_PI / 180.0 / DEG_SCALE;
-            rx_joint_rad_[0] = JOINT_DIR[0] * static_cast<double>(rx.Real_Joint_1) * RAW_TO_RAD + JOINT_OFFSET_RAD[0];
-            rx_joint_rad_[1] = JOINT_DIR[1] * static_cast<double>(rx.Real_Joint_2) * RAW_TO_RAD + JOINT_OFFSET_RAD[1];
-            rx_joint_rad_[2] = JOINT_DIR[2] * static_cast<double>(rx.Real_Joint_3) * RAW_TO_RAD + JOINT_OFFSET_RAD[2];
-            rx_joint_rad_[3] = JOINT_DIR[3] * static_cast<double>(rx.Real_Joint_4) * RAW_TO_RAD + JOINT_OFFSET_RAD[3];
-            rx_joint_rad_[4] = JOINT_DIR[4] * static_cast<double>(rx.Real_Joint_5) * RAW_TO_RAD + JOINT_OFFSET_RAD[4];
-            rx_joint_rad_[5] = JOINT_DIR[5] * static_cast<double>(rx.Real_Joint_6) * RAW_TO_RAD + JOINT_OFFSET_RAD[5];
-            rx_data_valid_ = true;
-
-            // Btn=17 上升沿：抓拍当前 actual 作为 snapshot。force-sync 窗口里 TX
-            // 恒等于此 snapshot（不跟 RX），让 MCU 看到稳定 cmd 就地不动。
-            if (button_rising)
-            {
-              for (int i = 0; i < 6; ++i)
-                snapshot_pos_[i] = rx_joint_rad_[i];
-            }
-          }
-
-          // Btn=17 上升沿：启动 1.2s force-sync 窗口。release 语义保证 snapshot_pos_
-          // 写入对 write() 的 acquire load 可见。1.2s = 800ms 等 MCU 稳定 + ~200ms
-          // serial_comm_node 走 JTC restart + 200ms 缓冲。
-          if (button_rising)
-          {
-            const auto deadline = std::chrono::steady_clock::now() +
-                                  std::chrono::milliseconds(1200);
-            force_sync_until_ns_.store(
-                deadline.time_since_epoch().count(),
-                std::memory_order_release);
-            RCLCPP_INFO(logger,
-                        "Btn=17 上升沿，snapshot=[%.3f %.3f %.3f %.3f %.3f %.3f] rad，"
-                        "启动 1.2s force-sync 窗口",
-                        snapshot_pos_[0], snapshot_pos_[1], snapshot_pos_[2],
-                        snapshot_pos_[3], snapshot_pos_[4], snapshot_pos_[5]);
-          }
-          prev_button_ = rx.Button;
-
-          if (log_serial_)
-          {
-            RCLCPP_INFO(logger,
-                        "RX  Joy: x=%d y=%d z=%d P=%d R=%d Btn=%u | "
-                        "Real_J(deg): %.2f %.2f %.2f %.2f %.2f %.2f",
-                        rx.Arm_Pos_x, rx.Arm_Pos_y, rx.Arm_Pos_z,
-                        rx.Arm_Pos_Pitch, rx.Arm_Pos_Roll, rx.Button,
-                        rx.Real_Joint_1 / DEG_SCALE, rx.Real_Joint_2 / DEG_SCALE,
-                        rx.Real_Joint_3 / DEG_SCALE, rx.Real_Joint_4 / DEG_SCALE,
-                        rx.Real_Joint_5 / DEG_SCALE, rx.Real_Joint_6 / DEG_SCALE);
-          }
-
-          // 发布摇杆数据到 /serial_recv，供 serial_comm_node 订阅
-          std_msgs::msg::Float64MultiArray msg;
-          msg.data = {
-            static_cast<double>(rx.Arm_Pos_x),
-            static_cast<double>(rx.Arm_Pos_y),
-            static_cast<double>(rx.Arm_Pos_z),
-            static_cast<double>(rx.Arm_Pos_Pitch),
-            static_cast<double>(rx.Arm_Pos_Roll),
-            static_cast<double>(rx.Button),
-            static_cast<double>(rx.Real_Joint_1),
-            static_cast<double>(rx.Real_Joint_2),
-            static_cast<double>(rx.Real_Joint_3),
-            static_cast<double>(rx.Real_Joint_4),
-            static_cast<double>(rx.Real_Joint_5),
-            static_cast<double>(rx.Real_Joint_6)
-          };
-          recv_pub_->publish(msg);
+          handleRxFrame(uart_.read_data, logger);
+        }
+        // ReadData 返回 false：要么帧没收完整，要么 read()<=0（断开）
+        if (uart_.last_read_disconnected_)
+        {
+          RCLCPP_WARN(logger, "检测到串口断开（read 返回 EOF/-1），进入重连流程");
+          serial_connected_.store(false, std::memory_order_release);
+          uart_.Close();
         }
       }
+      else if (ret < 0)
+      {
+        // select 报错（比如 EBADF），同样降级到重连
+        RCLCPP_WARN(logger, "select 出错（fd 失效），进入重连流程");
+        serial_connected_.store(false, std::memory_order_release);
+        uart_.Close();
+      }
+      // ret == 0：300ms 超时无数据，但 fd 仍健康——继续下一轮
     }
   }
 
@@ -387,6 +549,14 @@ private:
   // 后台 RX 线程
   std::thread       read_thread_;
   std::atomic<bool> running_{false};
+
+  // 串口连接状态（write 用 acquire 读，readLoop 用 release 写）。
+  // false 时 write() 静默丢弃 TX、readLoop 进入重连循环。
+  std::atomic<bool> serial_connected_{false};
+
+  // TX 丢弃节流（仅 ros2_control 主线程在 write() 中访问，无需原子）
+  uint64_t                              dropped_tx_count_{0};
+  std::chrono::steady_clock::time_point last_tx_warn_{};
 
   // RX 数据（mutex 保护，readLoop 写，read() 读）
   std::mutex rx_mutex_;

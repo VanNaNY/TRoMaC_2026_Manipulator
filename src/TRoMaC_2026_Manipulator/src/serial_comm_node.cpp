@@ -1,10 +1,3 @@
-// serial_comm_node — 精简版
-// 串口通信已移交 TRoMaCHardwareInterface (ros2_control 插件)
-// 本节点仅负责：
-//   1. 订阅 /serial_recv（hardware interface 发布的摇杆数据）驱动 MoveIt Servo
-//   2. 订阅 /joint_states 更新 RobotState 供 Jacobian 退化使用
-//   3. Homing（回零）功能
-
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
@@ -32,7 +25,8 @@
 static constexpr char START_SERVO_SERVICE[] = "/servo_node/start_servo";
 
 // 控制模式枚举
-enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 = 2, HOMING = 3 };
+enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 = 2, HOMING = 3, 
+                               GETENERGY_1 = 4, GETENERGY_2 = 5, GETENERGY_3 = 6};
 
 // 前三轴/后三轴关节名
 static const std::vector<std::string> JOINT_GROUP_1_NAMES = {
@@ -247,10 +241,16 @@ private:
     ControlMode new_mode = ControlMode::CARTESIAN;
     if (button == 9)
       new_mode = ControlMode::JOINT_GROUP_1;
-    else if (button == 11)
-      new_mode = ControlMode::JOINT_GROUP_2;
     else if (button == 12)
-      new_mode = ControlMode::HOMING;
+      new_mode = ControlMode::JOINT_GROUP_2;
+    else if (button == 13)
+      new_mode = ControlMode::HOMING;       
+    else if (button == 14)
+      new_mode = ControlMode::GETENERGY_1;
+    else if (button == 11) 
+      new_mode = ControlMode::GETENERGY_2;
+    else if (button == 10)
+      new_mode = ControlMode::GETENERGY_3;
 
     ControlMode old_mode = control_mode_.exchange(new_mode);
     if (old_mode != new_mode)
@@ -259,13 +259,25 @@ private:
           (new_mode == ControlMode::CARTESIAN)     ? "笛卡尔 Servo" :
           (new_mode == ControlMode::JOINT_GROUP_1) ? "关节遥控 (前三轴: 1, 2, 3)" :
           (new_mode == ControlMode::JOINT_GROUP_2) ? "关节遥控 (后三轴: 4, 5, 6)" :
-                                                     "回初始位姿";
+          (new_mode == ControlMode::HOMING)        ? "回初始位姿" :
+          (new_mode == ControlMode::GETENERGY_1)   ? "GetEnerge_1" :
+          (new_mode == ControlMode::GETENERGY_2)   ? "GetEnerge_2" :
+          (new_mode == ControlMode::GETENERGY_3)   ? "GetEnerge_3" :
+                                                     "(未知)";
       RCLCPP_INFO(get_logger(), "控制模式切换 → %s", mode_str);
 
-      if (new_mode == ControlMode::HOMING && !homing_active_.load())
+      // 一键动作分发：互斥（plan_active_），仅在模式跳变时触发一次
+      if (!plan_active_.load())
       {
-        homing_active_ = true;
-        triggerHoming();
+        auto launch = [this](void (SerialCommNode::*m)()) {
+          plan_active_ = true;
+          std::thread(m, this).detach();
+        };
+
+        if      (new_mode == ControlMode::HOMING)      launch(&SerialCommNode::executeHoming);
+        else if (new_mode == ControlMode::GETENERGY_1) launch(&SerialCommNode::executeGetEnerge_1);
+        else if (new_mode == ControlMode::GETENERGY_2) launch(&SerialCommNode::executeGetEnerge_2);
+        else if (new_mode == ControlMode::GETENERGY_3) launch(&SerialCommNode::executeGetEnerge_3);
       }
     }
 
@@ -296,7 +308,7 @@ private:
 
         Eigen::Vector3d v_des(decouple_ee_max_ * vx * std::cos(yaw),
                               decouple_ee_max_ * vx * std::sin(yaw),
-                              decouple_ee_max_ * vz);
+                             -decouple_ee_max_ * vz);
 
         Eigen::Vector2d q_pitch = dampedPinvSolve(J_pitch, v_des, 0.05);
         q_dot[1] = std::clamp(q_pitch[0], -1.0, 1.0);
@@ -313,7 +325,7 @@ private:
       jog.header.frame_id = planning_frame_;
       jog.joint_names = {"1-joint", "2-joint", "3-joint",
                          "4-joint", "5-joint", "6-joint"};
-      jog.velocities  = {q_dot[0], q_dot[1], q_dot[2],
+      jog.velocities  = {q_dot[0], -q_dot[1], q_dot[2],
                          q_dot[3], q_dot[4], q_dot[5]};
       joint_jog_pub_->publish(jog);
     }
@@ -420,18 +432,36 @@ private:
     RCLCPP_INFO(get_logger(), "Servo 控制就绪，开始接受摇杆指令");
   }
 
-  // ---- Homing (回初始位姿) ----
-  // 下位机电机零点在 ROS 坐标系下的弧度值
+  // 零点偏移
+  // 记得一块改tromac_hardware_interface.cpp::JOINT_OFFSET_RAD
   static constexpr double joint_offset_rad_[6] = {
-    0.0, 0.0, 1.5708, 1.5447, -1.5936, 0.3654
+    -2.1715, 0.0, 1.7008, 1.8447, -1.4336, 1.8708
   };
 
-  std::atomic<bool> homing_active_{false};
+  // Homing
+  // ros_rad = JOINT_DIR · raw_deg · π/180 + JOINT_OFFSET_RAD
+  static constexpr double home_target_rad_[6] = {
+    -0.34914195,    
+     0.83863071,  
+     0.43832220,   
+    -0.01318826,   
+    -0.07533808,   
+     0.36644720    
+  };
 
-  void triggerHoming()
-  {
-    std::thread(&SerialCommNode::executeHoming, this).detach();
-  }
+  static constexpr double getEnerge_1[6] = {
+    -0.4787, 1.0472, 1.966, 0.3789, -0.3691, 1.0051
+  };
+  // 67.00 82.99 -11.00 -33.99 68.00 0.16
+  static constexpr double getEnerge_2[6] = {
+    -1.0021, 1.2486, 1.5089, 0.5902, 1.2513, 1.8736
+  };
+
+  static constexpr double getEnerge_3[6] = {
+    -0.4787, 1.0472, 1.6770, 0.3789, -0.3691, 1.0051
+  };
+
+  std::atomic<bool> plan_active_{false};
 
   static bool callServiceViaTemp(const std::string& service_name,
                                  const rclcpp::Logger& logger)
@@ -520,9 +550,11 @@ private:
     RCLCPP_INFO(logger, "JTC + Servo 重启完成，cmd 已对齐到真实位置");
   }
 
-  void executeHoming()
+  // pause servo → plan → execute → stop/start servo
+  // 所有一键动作最慈祥的父亲
+  void executeJointTarget(const double* target, const char* label)
   {
-    RCLCPP_INFO(get_logger(), "开始回初始位姿…");
+    RCLCPP_INFO(get_logger(), "开始执行 [%s]…", label);
     auto logger = get_logger();
 
     callServiceViaTemp("/servo_node/pause_servo", logger);
@@ -530,7 +562,7 @@ private:
     try
     {
       auto move_group_node = rclcpp::Node::make_shared(
-          "homing_move_group_node",
+          "joint_target_move_group_node",
           rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
 
       move_group_node->set_parameter(rclcpp::Parameter(
@@ -541,8 +573,8 @@ private:
       auto move_group = moveit::planning_interface::MoveGroupInterface(
           move_group_node, "manipulator");
 
-      move_group.setMaxVelocityScalingFactor(0.5);
-      move_group.setMaxAccelerationScalingFactor(0.5);
+      move_group.setMaxVelocityScalingFactor(1.0);
+      move_group.setMaxAccelerationScalingFactor(1.0);
       move_group.setPlanningTime(1.0);
 
       if (jacobian_ready_ && robot_state_ready_.load())
@@ -553,27 +585,40 @@ private:
       }
 
       auto joint_names = get_parameter("joint_names").as_string_array();
-      std::vector<double> target_joints(joint_offset_rad_, joint_offset_rad_ + 6);
+      std::vector<double> target_joints(target, target + 6);
       move_group.setJointValueTarget(joint_names, target_joints);
 
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       if (move_group.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS)
       {
-        RCLCPP_INFO(logger, "规划成功，执行…");
+        // 诊断 log：plan 出的 trajectory 总时长 + 最大速度。如果 scale 在 plan 端生效，
+        // 改 scale=0.3 vs 1.0 应该看到总时长 ~3 倍差异；如果两次一样，说明 plan 端没消费 scale。
+        const auto& pts = plan.trajectory_.joint_trajectory.points;
+        double max_vel = 0.0;
+        for (const auto& p : pts)
+          for (double v : p.velocities) max_vel = std::max(max_vel, std::abs(v));
+        const double dur = pts.empty()
+                               ? 0.0
+                               : rclcpp::Duration(pts.back().time_from_start).seconds();
+        RCLCPP_INFO(logger,
+                    "PLAN diag: %zu points, duration=%.3fs, max|vel|=%.3f rad/s",
+                    pts.size(), dur, max_vel);
+
+        RCLCPP_INFO(logger, "[%s] 规划成功，执行…", label);
         auto r = move_group.execute(plan);
         if (r == moveit::core::MoveItErrorCode::SUCCESS)
-          RCLCPP_INFO(logger, "已到达初始位姿");
+          RCLCPP_INFO(logger, "[%s] 已到达目标", label);
         else
-          RCLCPP_WARN(logger, "执行失败 (code: %d)", r.val);
+          RCLCPP_WARN(logger, "[%s] 执行失败 (code: %d)", label, r.val);
       }
       else
       {
-        RCLCPP_WARN(logger, "规划失败");
+        RCLCPP_WARN(logger, "[%s] 规划失败", label);
       }
     }
     catch (const std::exception& e)
     {
-      RCLCPP_ERROR(logger, "Homing 异常: %s", e.what());
+      RCLCPP_ERROR(logger, "[%s] 异常: %s", label, e.what());
     }
 
     callServiceViaTemp("/servo_node/stop_servo", logger);
@@ -581,10 +626,16 @@ private:
     callServiceViaTemp("/servo_node/start_servo", logger);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    homing_active_ = false;
+    plan_active_ = false;
     control_mode_ = ControlMode::CARTESIAN;
-    RCLCPP_INFO(logger, "Homing 完成，恢复笛卡尔 Servo");
+    RCLCPP_INFO(logger, "[%s] 流程结束，恢复笛卡尔 Servo", label);
   }
+
+  // 一键动作 wrapper：仅绑定目标关节值与显示名，全部委托给 executeJointTarget
+  void executeHoming()      { executeJointTarget(home_target_rad_, "Homing"); }
+  void executeGetEnerge_1() { executeJointTarget(getEnerge_1,      "GetEnerge_1"); }
+  void executeGetEnerge_2() { executeJointTarget(getEnerge_2,      "GetEnerge_2"); }
+  void executeGetEnerge_3() { executeJointTarget(getEnerge_3,      "GetEnerge_3"); }
 
   // ---- Members ----
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr recv_sub_;
@@ -607,8 +658,8 @@ private:
   bool         send_log_{false};
 
   // ---- Jacobian 关节限位退化 ----
-  moveit::core::RobotModelPtr                     robot_model_;
-  std::shared_ptr<moveit::core::RobotState>       robot_state_;
+  moveit::core::RobotModelPtr                      robot_model_;
+  std::shared_ptr<moveit::core::RobotState>        robot_state_;
   const moveit::core::JointModelGroup*             jmg_{nullptr};
   const moveit::core::LinkModel*                   jacobian_link_{nullptr};
   std::mutex                                       robot_state_mutex_;

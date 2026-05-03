@@ -22,7 +22,7 @@ namespace TRoMaC
         int fd = 0;
         if (comport == 1)
         {
-            fd = open("/dev/ttyACM0", O_RDWR | O_NOCTTY | O_NDELAY);
+            fd = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY | O_NDELAY);
             if (-1 == fd)
             {
                 perror("Can't Open Serial Port");
@@ -31,7 +31,7 @@ namespace TRoMaC
         }
         else if(comport == 2)
         {
-            fd = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY | O_NDELAY);
+            fd = open("/dev/ttyACM0", O_RDWR | O_NOCTTY | O_NDELAY);
             if (-1 == fd)
             {
                 perror("Can't Open Serial Port");
@@ -183,10 +183,17 @@ namespace TRoMaC
 
     bool Uart::Open(const std::string& device_path, int _speed)
     {
+        last_read_disconnected_ = false;
+        // 重连入口需要重置帧解析状态机和缓冲区，避免上一帧的残留 payload 干扰新会话
+        rx_state_      = RxState::WAIT_HEADER;
+        rx_payload_idx_ = 0;
+        rx_ring_pos_   = 0;
+        rx_ring_len_   = 0;
+
         int fd = open_port(device_path);
         if(fd < 0)
         {
-            perror("open_port error");
+            // 频繁失败时（重连循环每秒一次）保持静默，避免 perror 刷屏
             return false;
         }
         if((set_opt(fd, _speed, 8, 'N', 1)) < 0)
@@ -241,8 +248,11 @@ namespace TRoMaC
                 rx_ring_len_ = read(serial_id, rx_ring_, sizeof(rx_ring_));
                 if (rx_ring_len_ <= 0)
                 {
+                    // select 已报 ready 仍读不到任何数据：USB 拔除导致 EOF（read=0）
+                    // 或设备移除（read=-1, errno=EIO/ENXIO/EBADF）。两种都视为断开。
                     rx_ring_len_ = 0;
-                    return false;  // 没有更多数据
+                    last_read_disconnected_ = true;
+                    return false;
                 }
             }
 
@@ -300,6 +310,9 @@ namespace TRoMaC
 
     void Uart::send(const VisionData& data)
     {
+        // 串口未打开（重连期间 hw_iface 已关闭 fd）：静默丢弃，避免 write(-1,…) 刷屏
+        if (serial_id < 0) return;
+
         TXunion.VisionFrameTX.Joint_1 = data.Joint_1;
         TXunion.VisionFrameTX.Joint_2 = data.Joint_2;
         TXunion.VisionFrameTX.Joint_3 = data.Joint_3;
