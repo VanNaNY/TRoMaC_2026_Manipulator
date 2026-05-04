@@ -315,10 +315,20 @@ private:
         q_dot[2] = std::clamp(q_pitch[1], -1.0, 1.0);
       }
 
-      geometry_msgs::msg::TwistStamped zero_twist;
-      zero_twist.header.stamp    = now();
-      zero_twist.header.frame_id = planning_frame_;
-      servo_pub_->publish(zero_twist);
+      // 其余通道（vx/vy/vz/roll/pitch）仍走下面的 JointJog，互不干扰。
+      // Servo 内部会把 TwistStamped 解出的关节速度叠加到 JointJog 上。
+      geometry_msgs::msg::TwistStamped twist;
+      twist.header.stamp = now();
+      if (button == 8)
+      {
+        twist.header.frame_id = "6Link";
+        twist.twist.linear.z  = decouple_ee_max_ * joy_max_linear_;
+      }
+      else
+      {
+        twist.header.frame_id = planning_frame_;
+      }
+      servo_pub_->publish(twist);
 
       control_msgs::msg::JointJog jog;
       jog.header.stamp    = now();
