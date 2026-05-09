@@ -65,7 +65,7 @@ public:
     // 摇杆相关参数
     declare_parameter("enable_servo_control", true);
     declare_parameter("planning_frame", std::string("base_link"));
-    declare_parameter("joy_deadzone_xyz", 500);
+    declare_parameter("joy_deadzone_xyz", 750);
     declare_parameter("joy_deadzone_angular", 40);
     declare_parameter("joy_max_linear", 1.0);
     declare_parameter("joy_max_angular", 1.5);
@@ -174,9 +174,12 @@ public:
 
     jacobian_ready_ = true;
 
-    jacobian_link_ = robot_model_->getLinkModel("4_Link");
+    // 解耦计算的雅可比 ref_link 必须与 servo 的 ee_frame_name (6Link) 对齐，
+    // 否则 dampedPinvSolve 算出的 J2/J3 速度对应的不是末端 6Link 的运动，
+    // 而是中间 link，末端实际轨迹会和摇杆指令方向偏离。
+    jacobian_link_ = robot_model_->getLinkModel("6Link");
     if (!jacobian_link_)
-      RCLCPP_WARN(get_logger(), "未找到 4_Link，Jacobian 将使用默认末端 link");
+      RCLCPP_WARN(get_logger(), "未找到 6Link，Jacobian 将使用默认末端 link");
 
     RCLCPP_INFO(get_logger(),
                 "Jacobian 已初始化 (margin=%.1f°, ref_link=%s)",
@@ -319,9 +322,9 @@ private:
 
     if (new_mode == ControlMode::CARTESIAN)
     {
-      double vx = applyJoyAxis(arm_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      double vx = applyJoyAxis(arm_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
       double vy = applyJoyAxis(arm_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
-      double vz = applyJoyAxis(arm_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      double vz = applyJoyAxis(arm_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
       double v_roll  = applyJoyAxis(arm_roll,  joy_deadzone_angular_, 100, joy_max_angular_);
       double v_pitch = applyJoyAxis(arm_pitch, joy_deadzone_angular_, 100, joy_max_angular_);
 
@@ -487,12 +490,14 @@ private:
   // Homing
   // ros_rad = raw_deg · π/180 + JOINT_OFFSET_RAD
   static constexpr double home_target_rad_[6] = {
+    0.122173, 0.610865, 0.5171177, -0.208528, -0.9265, 5.55449
+    /*
      0.07883333,    
      0.83863071,  
      0.43832220,   
     -0.01318826,   
     -0.07533808,   
-     0.36644720    
+     0.36644720*/    
   };
 
   static constexpr double getEnerge_1[6] = {
@@ -504,7 +509,7 @@ private:
   };
 
   static constexpr double getEnerge_3[6] = {
-    0.07883333, 1.0472, 1.6770, 0.3789, -0.3691, 1.0051
+    0.0, 1.3788, 1.4566, -0.2434, -1.2583, 5.5046
   };
 
   std::atomic<bool> plan_active_{false};
