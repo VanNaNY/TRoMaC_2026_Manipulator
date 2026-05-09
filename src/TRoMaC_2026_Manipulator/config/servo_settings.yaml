@@ -16,8 +16,9 @@ publish_joint_positions: true # 发布的轨迹点需不需要带上关节角
 publish_joint_velocities: true # 发布的轨迹点需不需要带上关节角速度
 publish_joint_accelerations: false # 发布的轨迹点需不需要带上关节角加速度
 
-## Smoothing
-smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin" # 可换更激进的平滑滤波：online_signal_smoothing::RuckigFilterPlugin
+## Smoothing  online_signal_smoothing::ButterworthFilterPlugin
+# Ruckig 在线滤波 (online_signal_smoothing::RuckigFilterPlugin) 要 Iron/Jazzy 才有。
+smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
 low_pass_filter_coeff: 2.0  # 适度消除输入抖动
 
 ## Planning scene ownership

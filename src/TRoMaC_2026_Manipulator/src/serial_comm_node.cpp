@@ -65,10 +65,10 @@ public:
     // 摇杆相关参数
     declare_parameter("enable_servo_control", true);
     declare_parameter("planning_frame", std::string("base_link"));
-    declare_parameter("joy_deadzone_xyz", 10);
-    declare_parameter("joy_deadzone_angular", 1);
+    declare_parameter("joy_deadzone_xyz", 500);
+    declare_parameter("joy_deadzone_angular", 40);
     declare_parameter("joy_max_linear", 1.0);
-    declare_parameter("joy_max_angular", 1.0);
+    declare_parameter("joy_max_angular", 1.5);
     declare_parameter("decouple_ee_max", 1.0);
     declare_parameter("send_log", true);
 
@@ -185,13 +185,12 @@ public:
   }
 
 private:
-  // ---- serial_recv topic 回调：处理摇杆数据并驱动 Servo ----
+  // serial_recv topic 回调：处理摇杆数据并驱动 Servo
   void recvCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
   {
-    // 数据格式: [x, y, z, pitch, roll, button, real_j1~j6]
     if (msg->data.size() < 6) 
     {
-      //RCLCPP_WARN(get_logger(), "没有下位机传值！检查遥控器是否连接正常！！");
+      //RCLCPP_WARN(get_logger(), "没有下位机传值！检查自定义控制器是否连接正常！！");
       return;
     }
 
@@ -201,22 +200,59 @@ private:
     int16_t arm_pitch = static_cast<int16_t>(msg->data[3]);
     int16_t arm_roll  = static_cast<int16_t>(msg->data[4]);
     uint8_t button    = static_cast<uint8_t>(msg->data[5]);
+    // 仅作快速验证目的使用
+    uint8_t fault_flags = (msg->data.size() >= 13)
+                              ? static_cast<uint8_t>(msg->data[12])
+                              : 0;
 
-    // Btn=17 上升沿 → 延迟 800ms 后触发 JTC 重启同步。
+    // 避免恢复后第一帧把堵转期间按下的17误判成新的上升沿（会触发一次多余的 resync）
+    const uint8_t last_button = temp_button;
+    temp_button = button;
+
+    // 堵转保护
+    const bool joystick_zero =
+        (std::abs(arm_x)     <= joy_deadzone_xyz_)     &&
+        (std::abs(arm_y)     <= joy_deadzone_xyz_)     &&
+        (std::abs(arm_z)     <= joy_deadzone_xyz_)     &&
+        (std::abs(arm_pitch) <= joy_deadzone_angular_) &&
+        (std::abs(arm_roll)  <= joy_deadzone_angular_);
+
+    const bool fault_now = (fault_flags != 0);
+    const bool was_in_fault = in_fault_.load();
+
+    if (fault_now && !was_in_fault && !fault_transition_active_.exchange(true))
+    {
+      in_fault_ = true;
+      RCLCPP_WARN(get_logger(),
+                  "堵转保护触发 (fault_flags=0x%02X)，锁定 JTC + Servo",
+                  fault_flags);
+      std::thread([this]() { this->lockOnFault(); }).detach();
+    }
+    else if (!fault_now && was_in_fault && joystick_zero &&
+             !fault_transition_active_.exchange(true))
+    {
+      RCLCPP_INFO(get_logger(),
+                  "堵转已清除且摇杆归零，恢复 JTC + Servo");
+      std::thread([this]() { this->unlockAfterFault(); }).detach();
+    }
+
+    // 锁定期间所有 servo/jog 都跳过
+    if (in_fault_.load()) return;
+
+    // Btn=17后延迟800ms后触发JTC重启同步。
     // hw_interface 在 Btn=17 那一刻已抓拍 snapshot 并启动 1.2s force-sync 窗口
     // （TX 恒等于 snapshot），800ms 后 MCU 已稳在 snapshot 上，此时 resync 让 JTC
-    // 内部 last_commanded 锁定到 hw_positions_ ≈ snapshot；force-sync 1.2s 结束
+    // 内部 last_commanded 锁定到 hw_positions_ ≈ snapshot；force-sync 1.2s 结束d
     // 后 JTC 接管，cmd 与 force-sync 输出一致，无阶跃。
-    if (button == 17 && last_button_ != 17)
+    if (button == 17 && last_button != 17)
     {
-      RCLCPP_INFO(get_logger(), "检测到 Btn=17 上升沿，800ms 后触发 JTC 重启同步");
+      RCLCPP_INFO(get_logger(), "检测到 Btn=17 上升沿, 800ms 后触发 JTC 重启同步");
       std::thread([this]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(800));
         this->resyncControllerToActual();
       }).detach();
     }
-    last_button_ = button;
-
+    //last_button_ = button;
     //RCLCPP_INFO(get_logger(), "收到下位机传值！");
 
     if (send_log_)
@@ -241,15 +277,15 @@ private:
     ControlMode new_mode = ControlMode::CARTESIAN;
     if (button == 9)
       new_mode = ControlMode::JOINT_GROUP_1;
-    else if (button == 12)
+    else if (button == 8)
       new_mode = ControlMode::JOINT_GROUP_2;
-    else if (button == 13)
+    else if (button == 3)
       new_mode = ControlMode::HOMING;       
-    else if (button == 14)
+    else if (button == 4)
       new_mode = ControlMode::GETENERGY_1;
-    else if (button == 11) 
+    else if (button == 5) 
       new_mode = ControlMode::GETENERGY_2;
-    else if (button == 10)
+    else if (button == 6)
       new_mode = ControlMode::GETENERGY_3;
 
     ControlMode old_mode = control_mode_.exchange(new_mode);
@@ -319,7 +355,7 @@ private:
       // Servo 内部会把 TwistStamped 解出的关节速度叠加到 JointJog 上。
       geometry_msgs::msg::TwistStamped twist;
       twist.header.stamp = now();
-      if (button == 8)
+      if (button == 7)
       {
         twist.header.frame_id = "6Link";
         twist.twist.linear.z  = decouple_ee_max_ * joy_max_linear_;
@@ -445,13 +481,13 @@ private:
   // 零点偏移
   // 记得一块改tromac_hardware_interface.cpp::JOINT_OFFSET_RAD
   static constexpr double joint_offset_rad_[6] = {
-    -2.1715, 0.0, 1.7008, 1.8447, -1.4336, 1.8708
+    0.0, 0.0, 1.7008, -1.79677778, -1.677, 1.8708
   };
 
   // Homing
-  // ros_rad = JOINT_DIR · raw_deg · π/180 + JOINT_OFFSET_RAD
+  // ros_rad = raw_deg · π/180 + JOINT_OFFSET_RAD
   static constexpr double home_target_rad_[6] = {
-    -0.34914195,    
+     0.07883333,    
      0.83863071,  
      0.43832220,   
     -0.01318826,   
@@ -460,15 +496,15 @@ private:
   };
 
   static constexpr double getEnerge_1[6] = {
-    -0.4787, 1.0472, 1.966, 0.3789, -0.3691, 1.0051
+    0.07883333, 1.0472, 1.966, 0.3789, -0.3691, 1.0051
   };
   // 67.00 82.99 -11.00 -33.99 68.00 0.16
   static constexpr double getEnerge_2[6] = {
-    -1.0021, 1.2486, 1.5089, 0.5902, 1.2513, 1.8736
+   -0.44456667, 1.2486, 1.5089, 0.5902, 1.2513, 1.8736
   };
 
   static constexpr double getEnerge_3[6] = {
-    -0.4787, 1.0472, 1.6770, 0.3789, -0.3691, 1.0051
+    0.07883333, 1.0472, 1.6770, 0.3789, -0.3691, 1.0051
   };
 
   std::atomic<bool> plan_active_{false};
@@ -490,6 +526,90 @@ private:
       return future.get()->success;
     RCLCPP_WARN(logger, "调用 %s 超时", service_name.c_str());
     return false;
+  }
+
+  //pause servo, deactivate JTC，进入锁定状态。
+  //recvCallback 在 fault_flags 清零且摇杆归零时调 unlockAfterFault。
+  void lockOnFault()
+  {
+    using SwitchController = controller_manager_msgs::srv::SwitchController;
+    auto logger = get_logger();
+    constexpr const char* kCtrl = "manipulator_controller";
+    callServiceViaTemp("/servo_node/stop_servo", logger);
+    // deactivate JTC
+    auto tmp = rclcpp::Node::make_shared("fault_lock_caller");
+    auto client = tmp->create_client<SwitchController>(
+        "/controller_manager/switch_controller");
+    if (client->wait_for_service(std::chrono::seconds(2)))
+    {
+      auto req = std::make_shared<SwitchController::Request>();
+      req->deactivate_controllers = {kCtrl};
+      req->strictness    = SwitchController::Request::STRICT;
+      req->activate_asap = true;
+
+      auto future = client->async_send_request(req);
+      if (rclcpp::spin_until_future_complete(tmp, future, std::chrono::seconds(3)) !=
+          rclcpp::FutureReturnCode::SUCCESS)
+        RCLCPP_WARN(logger, "lockOnFault: deactivate 调用超时");
+      else if (!future.get()->ok)
+        RCLCPP_WARN(logger, "lockOnFault: deactivate 被拒绝");
+      else
+        RCLCPP_INFO(logger, "lockOnFault: JTC 已停用");
+    }
+    else
+    {
+      RCLCPP_WARN(logger,
+                  "/controller_manager/switch_controller 不可用，跳过 deactivate");
+    }
+
+    fault_transition_active_ = false;
+  }
+
+  // activate JTC, start servo
+  void unlockAfterFault()
+  {
+    using SwitchController = controller_manager_msgs::srv::SwitchController;
+    auto logger = get_logger();
+    constexpr const char* kCtrl = "manipulator_controller";
+
+    auto tmp = rclcpp::Node::make_shared("fault_unlock_caller");
+    auto client = tmp->create_client<SwitchController>(
+        "/controller_manager/switch_controller");
+    if (!client->wait_for_service(std::chrono::seconds(2)))
+    {
+      RCLCPP_WARN(logger,
+                  "/controller_manager/switch_controller 不可用，恢复失败");
+      fault_transition_active_ = false;
+      return;
+    }
+
+    auto req = std::make_shared<SwitchController::Request>();
+    req->activate_controllers = {kCtrl};
+    req->strictness    = SwitchController::Request::STRICT;
+    req->activate_asap = true;
+
+    auto future = client->async_send_request(req);
+    if (rclcpp::spin_until_future_complete(tmp, future, std::chrono::seconds(3)) !=
+        rclcpp::FutureReturnCode::SUCCESS)
+    {
+      RCLCPP_WARN(logger, "unlockAfterFault: activate 调用超时");
+      fault_transition_active_ = false;
+      return;
+    }
+    if (!future.get()->ok)
+    {
+      RCLCPP_WARN(logger, "unlockAfterFault: activate 被拒绝");
+      fault_transition_active_ = false;
+      return;
+    }
+
+    // 先让 JTC 跑一拍，让对齐后的 hw_commands_ 推送到 /commanded_joint_states
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    callServiceViaTemp("/servo_node/start_servo", logger);
+
+    in_fault_                 = false;
+    fault_transition_active_  = false;
+    RCLCPP_INFO(logger, "堵转恢复完成，可正常控制");
   }
 
   // deactivate→activate manipulator_controller，让 JTC 用 hw_positions_ 做新起点。
@@ -655,9 +775,11 @@ private:
 
   bool                     enable_servo_control_{false};
   std::atomic<ControlMode> control_mode_{ControlMode::CARTESIAN};
+  uint8_t temp_button{0};
 
-  // Btn=17 上升沿检测（与下位机 Btn 码一致）
-  uint8_t last_button_{0};
+  std::atomic<bool> in_fault_{false}; // 堵转锁定中（lockOnFault 设 true，unlockAfterFault 设 false）；
+  std::atomic<bool> fault_transition_active_{false}; //防 lockOnFault/unlockAfterFault 重入（service 调用是异步的，
+// 期间 recvCallback 可能再次满足触发条件，没这个互斥会重复 spawn 线程）。
 
   std::string  planning_frame_;
   int16_t      joy_deadzone_xyz_{30};

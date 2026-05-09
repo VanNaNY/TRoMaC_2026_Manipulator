@@ -33,22 +33,19 @@ class TRoMaCHardwareInterface : public hardware_interface::SystemInterface
 {
 public:
   // 下位机电机零点在 ROS 坐标系下的弧度值。
-  // 关系: ros_rad = JOINT_DIR * raw_deg * π/180 + JOINT_OFFSET_RAD
-  // 含义: 当下位机报告 raw=0（MCU 自身零点）时，ROS 看到的关节弧度。
-  // J1 的 ROS 零点被人为后移 124.417145° —— 即把"下位机 +124.417145°"位置定义为 ROS 0。
-  // 因此 OFFSET[0] = -124.417145° × π/180 = -2.17148883 rad（MCU-zero 在 ROS 里读 -2.17148883）。
+  // ros_rad = JOINT_DIR * raw_deg * π/180 + JOINT_OFFSET_RAD
   static constexpr double JOINT_OFFSET_RAD[6] = {
-    -2.17148883, 
+    0.0,
     0.0,
     1.7008,
-    1.8447,
-    -1.4336,
+    -1.79677778,
+    -1.677,
     1.8708
   };
 
   // 下位机 ↔ ROS 关节旋转方向系数
   static constexpr double JOINT_DIR[6] = {
-    1.0, 1.0, -1.0, -1.0, 1.0, 1.0
+    -1.0, 1.0, -1.0, -1.0, 1.0, 1.0
   };
 
   // 串口收发使用 int16_t，但单位为 0.01° (定点)，避免整数度量化导致 MCU 死区
@@ -354,13 +351,18 @@ private:
     if (log_serial_)
     {
       RCLCPP_INFO(logger,
-                  "RX  Joy: x=%d y=%d z=%d P=%d R=%d Btn=%u | "
+                  "RX  Joy: x=%d y=%d z=%d P=%d R=%d Btn=%u Fault_Flags=%u| "
                   "Real_J(deg): %.2f %.2f %.2f %.2f %.2f %.2f",
                   rx.Arm_Pos_x, rx.Arm_Pos_y, rx.Arm_Pos_z,
-                  rx.Arm_Pos_Pitch, rx.Arm_Pos_Roll, rx.Button,
+                  rx.Arm_Pos_Pitch, rx.Arm_Pos_Roll, rx.Button, rx.Fault_Flags,
                   rx.Real_Joint_1 / DEG_SCALE, rx.Real_Joint_2 / DEG_SCALE,
                   rx.Real_Joint_3 / DEG_SCALE, rx.Real_Joint_4 / DEG_SCALE,
                   rx.Real_Joint_5 / DEG_SCALE, rx.Real_Joint_6 / DEG_SCALE);
+    }
+
+    if (rx.Fault_Flags)
+    {
+      RCLCPP_WARN(logger, "下位机堵转报警！！！");
     }
 
     std_msgs::msg::Float64MultiArray msg;
@@ -376,7 +378,8 @@ private:
       static_cast<double>(rx.Real_Joint_3),
       static_cast<double>(rx.Real_Joint_4),
       static_cast<double>(rx.Real_Joint_5),
-      static_cast<double>(rx.Real_Joint_6)
+      static_cast<double>(rx.Real_Joint_6),
+      static_cast<double>(rx.Fault_Flags)
     };
     recv_pub_->publish(msg);
   }

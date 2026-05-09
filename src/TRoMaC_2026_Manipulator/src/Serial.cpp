@@ -270,13 +270,9 @@ namespace TRoMaC
                 break;
 
             case RxState::READ_PAYLOAD:
-                if (byte == FRAME_HEADER)
-                {
-                    // payload 中间又遇到帧头 → 之前的帧已损坏，
-                    // 把这个字节当作新帧的帧头，重新开始收 payload
-                    rx_payload_idx_ = 0;
-                    break;
-                }
+                // 不能因为 payload 内出现 0x78 就重置 idx——24B payload 是 6×int16 关节定点值，
+                // 合法地包含 FRAME_HEADER/FRAME_TAIL 字节（如 Joint_3≈14° → raw=0x0578）。
+                // 信任固定长度即可：若实际丢字节，下面 WAIT_TAIL 命中非 0x91 会回 WAIT_HEADER 重新搜。
                 rx_payload_buf_[rx_payload_idx_++] = byte;
                 if (rx_payload_idx_ >= RX_PAYLOAD_SIZE)
                 {
@@ -292,17 +288,9 @@ namespace TRoMaC
                     rx_state_ = RxState::WAIT_HEADER;
                     return true;
                 }
-                else if (byte == FRAME_HEADER)
-                {
-                    // 帧尾位置不对，但这是新帧的帧头
-                    rx_payload_idx_ = 0;
-                    rx_state_ = RxState::READ_PAYLOAD;
-                }
-                else
-                {
-                    // 帧尾校验失败，丢弃，回到等待帧头
-                    rx_state_ = RxState::WAIT_HEADER;
-                }
+                // 帧尾校验失败：丢弃当前 payload，回到 WAIT_HEADER 让下一个 0x78 重启帧。
+                // 即使该字节本身就是 0x78，丢一帧也比错位重启安全。
+                rx_state_ = RxState::WAIT_HEADER;
                 break;
             }
         }

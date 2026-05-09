@@ -18,10 +18,10 @@
 #define FRAME_HEADER     (0x78)
 #define FRAME_TAIL       (0x91)
 
-#define TX_PAYLOAD_SIZE  (12) 
-#define RX_PAYLOAD_SIZE  (23)  
-#define TX_FRAME_SIZE    (TX_PAYLOAD_SIZE + 2) 
-#define RX_FRAME_SIZE    (RX_PAYLOAD_SIZE + 2) 
+#define TX_PAYLOAD_SIZE  (12)
+#define RX_PAYLOAD_SIZE  (24)
+#define TX_FRAME_SIZE    (TX_PAYLOAD_SIZE + 2)
+#define RX_FRAME_SIZE    (RX_PAYLOAD_SIZE + 2)
 
 namespace TRoMaC
 {
@@ -35,6 +35,7 @@ namespace TRoMaC
         int16_t     Arm_Pos_Pitch;
         int16_t     Arm_Pos_Roll;
         uint8_t     Button;
+        uint8_t     Fault_Flags;
 
         int16_t     Real_Joint_1;
         int16_t     Real_Joint_2;
@@ -78,6 +79,7 @@ namespace TRoMaC
         int16_t     Arm_Pos_Pitch;
         int16_t     Arm_Pos_Roll;
         uint8_t     Button;
+        uint8_t     Fault_Flags;
 
         int16_t     Real_Joint_1;
         int16_t     Real_Joint_2;
