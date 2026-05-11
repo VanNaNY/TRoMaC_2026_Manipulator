@@ -70,7 +70,7 @@ public:
     declare_parameter("joy_max_linear", 1.0);
     declare_parameter("joy_max_angular", 1.5);
     declare_parameter("decouple_ee_max", 1.0);
-    declare_parameter("send_log", true);
+    declare_parameter("send_log", false);
 
     declare_parameter("joint_names", std::vector<std::string>{
         "1-joint", "2-joint", "3-joint",
@@ -484,32 +484,31 @@ private:
   // 零点偏移
   // 记得一块改tromac_hardware_interface.cpp::JOINT_OFFSET_RAD
   static constexpr double joint_offset_rad_[6] = {
-    0.0, 0.0, 1.7008, -1.79677778, -1.677, 1.8708
+    0.0, 0.0, 1.7008, -1.79677778, -1.450, 1.8708      // -1.677
   };
 
   // Homing
   // ros_rad = raw_deg · π/180 + JOINT_OFFSET_RAD
   static constexpr double home_target_rad_[6] = {
-    0.122173, 0.610865, 0.5171177, -0.208528, -0.9265, 5.55449
-    /*
+    //0.122173, 0.610865, 0.5171177, -0.208528, -0.9265, 5.55449
      0.07883333,    
      0.83863071,  
      0.43832220,   
     -0.01318826,   
     -0.07533808,   
-     0.36644720*/    
+     0.36644720    
   };
 
   static constexpr double getEnerge_1[6] = {
-    0.07883333, 1.0472, 1.966, 0.3789, -0.3691, 1.0051
+    0.07883333, 1.0472, 1.966, 0.3789, -0.1421, 1.0051
   };
   // 67.00 82.99 -11.00 -33.99 68.00 0.16
   static constexpr double getEnerge_2[6] = {
-   -0.44456667, 1.2486, 1.5089, 0.5902, 1.2513, 1.8736
+   -0.44456667, 1.2486, 1.5089, 0.5902, 1.4783, 1.8736
   };
 
   static constexpr double getEnerge_3[6] = {
-    0.0, 1.3788, 1.4566, -0.2434, -1.2583, 5.5046
+    0.0, 1.3788, 1.4566, -0.2434, -1.0313, 5.5046
   };
 
   std::atomic<bool> plan_active_{false};
