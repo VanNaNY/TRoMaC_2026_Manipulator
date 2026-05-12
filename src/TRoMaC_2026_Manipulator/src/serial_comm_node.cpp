@@ -28,11 +28,12 @@ static constexpr char START_SERVO_SERVICE[] = "/servo_node/start_servo";
 enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 = 2, HOMING = 3, 
                                GETENERGY_1 = 4, GETENERGY_2 = 5, GETENERGY_3 = 6};
 
-// 前三轴/后三轴关节名
+// 关节遥控分组（2-joint 锁死后不在列表中）
+// GROUP_1: yaw + 第一个可控 pitch + 第一个 roll；GROUP_2: 末端两关节
 static const std::vector<std::string> JOINT_GROUP_1_NAMES = {
-    "1-joint", "2-joint", "3-joint"};
+    "1-joint", "3-joint", "4-joint"};
 static const std::vector<std::string> JOINT_GROUP_2_NAMES = {
-    "4-joint", "5-joint", "6-joint"};
+    "5-joint", "6-joint"};
 
 // 阻尼伪逆求解：J^+ = V diag(s_i/(s_i²+λ²)) U^T
 static Eigen::VectorXd dampedPinvSolve(const Eigen::MatrixXd& J,
@@ -72,9 +73,9 @@ public:
     declare_parameter("decouple_ee_max", 1.0);
     declare_parameter("send_log", false);
 
+    // 2-joint (大pitch) 锁死后，只剩 5 个 active joint
     declare_parameter("joint_names", std::vector<std::string>{
-        "1-joint", "2-joint", "3-joint",
-        "4-joint", "5-joint", "6-joint"});
+        "1-joint", "3-joint", "4-joint", "5-joint", "6-joint"});
 
     planning_frame_       = get_parameter("planning_frame").as_string();
     joy_deadzone_xyz_     = static_cast<int16_t>(get_parameter("joy_deadzone_xyz").as_int());
@@ -154,7 +155,7 @@ public:
     }
 
     auto joint_names = get_parameter("joint_names").as_string_array();
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 5; ++i)
     {
       const auto* jm = robot_model_->getJointModel(joint_names[i]);
       if (!jm) continue;
@@ -328,7 +329,9 @@ private:
       double v_roll  = applyJoyAxis(arm_roll,  joy_deadzone_angular_, 100, joy_max_angular_);
       double v_pitch = applyJoyAxis(arm_pitch, joy_deadzone_angular_, 100, joy_max_angular_);
 
-      double q_dot[6] = {vy, 0.0, 0.0, v_roll, v_pitch, 0.0};
+      // 2-joint 锁死后，planning group active joints = [1-joint, 3-joint, 4-joint, 5-joint, 6-joint]
+      // q_dot 索引：[0]=1-joint(yaw 直接遥控), [1]=3-joint(由 Jacobian 解算 XZ), [2]=4-joint(roll), [3]=5-joint(pitch), [4]=6-joint
+      double q_dot[5] = {vy, 0.0, v_roll, v_pitch, 0.0};
 
       if (jacobian_ready_ && robot_state_ready_.load() &&
           (vx != 0.0 || vz != 0.0))
@@ -341,17 +344,16 @@ private:
           robot_state_->getJacobian(jmg_, jacobian_link_,
                                     Eigen::Vector3d::Zero(), J);
         }
-        Eigen::MatrixXd J_pitch(3, 2);
-        J_pitch.col(0) = J.block<3, 1>(0, 1);
-        J_pitch.col(1) = J.block<3, 1>(0, 2);
+        // 2-joint 已 fixed，Jacobian 第 1 列即 3-joint。仅 1-DOF 投影 v_des，
+        // 跟踪能力大幅缩水（只能沿 J.col(1) 瞬时方向产生位置变化）。
+        Eigen::MatrixXd J_pitch = J.block<3, 1>(0, 1);  // 3×1
 
         Eigen::Vector3d v_des(decouple_ee_max_ * vx * std::cos(yaw),
                               decouple_ee_max_ * vx * std::sin(yaw),
                              -decouple_ee_max_ * vz);
 
-        Eigen::Vector2d q_pitch = dampedPinvSolve(J_pitch, v_des, 0.05);
-        q_dot[1] = std::clamp(q_pitch[0], -1.0, 1.0);
-        q_dot[2] = std::clamp(q_pitch[1], -1.0, 1.0);
+        Eigen::VectorXd q3 = dampedPinvSolve(J_pitch, v_des, 0.05);
+        q_dot[1] = std::clamp(q3[0], -1.0, 1.0);
       }
 
       // 其余通道（vx/vy/vz/roll/pitch）仍走下面的 JointJog，互不干扰。
@@ -372,10 +374,8 @@ private:
       control_msgs::msg::JointJog jog;
       jog.header.stamp    = now();
       jog.header.frame_id = planning_frame_;
-      jog.joint_names = {"1-joint", "2-joint", "3-joint",
-                         "4-joint", "5-joint", "6-joint"};
-      jog.velocities  = {q_dot[0], -q_dot[1], q_dot[2],
-                         q_dot[3], q_dot[4], q_dot[5]};
+      jog.joint_names = {"1-joint", "3-joint", "4-joint", "5-joint", "6-joint"};
+      jog.velocities  = {q_dot[0], q_dot[1], q_dot[2], q_dot[3], q_dot[4]};
       joint_jog_pub_->publish(jog);
     }
     else if (new_mode == ControlMode::JOINT_GROUP_1 ||
@@ -390,15 +390,18 @@ private:
                                     ? JOINT_GROUP_1_NAMES
                                     : JOINT_GROUP_2_NAMES;
 
-      double vel_x = applyJoyAxis(arm_x, joy_deadzone_xyz_, 1000, joy_max_linear_);
-      double vel_y = applyJoyAxis(arm_y, joy_deadzone_xyz_, 1000, joy_max_linear_);
-      double vel_z = applyJoyAxis(arm_z, joy_deadzone_xyz_, 1000, joy_max_linear_);
+      // 摇杆 3 轴依次对应 group 中的关节，group 不足 3 个则只取前 size() 个
+      const double axes[3] = {
+          applyJoyAxis(arm_x, joy_deadzone_xyz_, 1000, joy_max_linear_),
+          applyJoyAxis(arm_y, joy_deadzone_xyz_, 1000, joy_max_linear_),
+          applyJoyAxis(arm_z, joy_deadzone_xyz_, 1000, joy_max_linear_)};
 
       control_msgs::msg::JointJog jog;
       jog.header.stamp    = now();
       jog.header.frame_id = planning_frame_;
-      jog.joint_names     = {joint_names[0], joint_names[1], joint_names[2]};
-      jog.velocities      = {vel_x, vel_y, vel_z};
+      const size_t n = std::min<size_t>(joint_names.size(), 3);
+      jog.joint_names.assign(joint_names.begin(), joint_names.begin() + n);
+      jog.velocities.assign(axes, axes + n);
       joint_jog_pub_->publish(jog);
     }
     // HOMING 模式：不发任何 servo 指令，由 MoveGroupInterface 控制
@@ -413,14 +416,14 @@ private:
       pos_map[msg->name[i]] = msg->position[i];
 
     const auto joint_names = get_parameter("joint_names").as_string_array();
-    if (static_cast<int>(joint_names.size()) < 6) return;
+    if (static_cast<int>(joint_names.size()) < 5) return;
 
     // state 日志：/joint_states 反馈的当前位置（非实际 TX，实际 TX 由 hw_interface 的 log_serial 输出）
     if (send_log_)
     {
-      double deg[6]{};
+      double deg[5]{};
       bool all_found = true;
-      for (int i = 0; i < 6; ++i)
+      for (int i = 0; i < 5; ++i)
       {
         auto it = pos_map.find(joint_names[i]);
         if (it == pos_map.end()) { all_found = false; break; }
@@ -429,8 +432,8 @@ private:
       if (all_found)
       {
         RCLCPP_INFO(get_logger(),
-                    "STATE  deg: %.2f %.2f %.2f %.2f %.2f %.2f",
-                    deg[0], deg[1], deg[2], deg[3], deg[4], deg[5]);
+                    "STATE  deg (1,3,4,5,6): %.2f %.2f %.2f %.2f %.2f",
+                    deg[0], deg[1], deg[2], deg[3], deg[4]);
       }
     }
 
@@ -439,7 +442,7 @@ private:
     std::lock_guard<std::mutex> lock(robot_state_mutex_);
     robot_state_->setVariablePositions(msg->name, msg->position);
     robot_state_->update();
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 5; ++i)
     {
       auto it = pos_map.find(joint_names[i]);
       if (it != pos_map.end())
@@ -481,34 +484,34 @@ private:
     RCLCPP_INFO(get_logger(), "Servo 控制就绪，开始接受摇杆指令");
   }
 
-  // 零点偏移
-  // 记得一块改tromac_hardware_interface.cpp::JOINT_OFFSET_RAD
-  static constexpr double joint_offset_rad_[6] = {
-    0.0, 0.0, 1.7008, -1.79677778, -1.450, 1.8708      // -1.677
+  // 零点偏移（与 tromac_hardware_interface.cpp::JOINT_OFFSET_RAD 保持一致）
+  // ros_rad = raw_deg · π/180 + JOINT_OFFSET_RAD  
+  static constexpr double joint_offset_rad_[5] = {
+    0.0, 2.9974, -1.09677778, -1.600, 1.8708
   };
 
-  // Homing
-  // ros_rad = raw_deg · π/180 + JOINT_OFFSET_RAD
-  static constexpr double home_target_rad_[6] = {
-    //0.122173, 0.610865, 0.5171177, -0.208528, -0.9265, 5.55449
-     0.07883333,    
-     0.83863071,  
-     0.43832220,   
-    -0.01318826,   
-    -0.07533808,   
-     0.36644720    
+  // 一键动作目标 (顺序: 1-joint, 3-joint, 4-joint, 5-joint, 6-joint)
+  // TODO: 2-joint 锁 0 后，原有四组预设值的末端落点都已偏离，
+  //       需在 RViz 实测后重新标定。下面保留的是把原 2-joint 项删除后的"占位"值，
+  //       不保证可达 / 不保证达到原目标位姿。
+  static constexpr double home_target_rad_[5] = {
+    -1.680,
+     2.75654456,
+    -1.68896800,
+    -1.19665441,
+     2.01706
   };
 
-  static constexpr double getEnerge_1[6] = {
-    0.07883333, 1.0472, 1.966, 0.3789, -0.1421, 1.0051
+  // cmd_deg: -50.18 54.55 33.48 35.07 8.38
+  static constexpr double getEnerge_1[5] = {
+    0.0, 2.04532289, -1.68111401, -0.98791303, 2.01705859
   };
-  // 67.00 82.99 -11.00 -33.99 68.00 0.16
-  static constexpr double getEnerge_2[6] = {
-   -0.44456667, 1.2486, 1.5089, 0.5902, 1.4783, 1.8736
+  // cmd_deg: -13.70 116.48 94.46 13.60 8.38
+  static constexpr double getEnerge_2[5] = {
+    0.23911011, 0.96444049, -2.74541579, -1.36263522, 2.01705859
   };
-
-  static constexpr double getEnerge_3[6] = {
-    0.0, 1.3788, 1.4566, -0.2434, -1.0313, 5.5046
+  static constexpr double getEnerge_3[5] = {
+    0.0, 1.4566, -0.2434, -1.0313, 5.5046
   };
 
   std::atomic<bool> plan_active_{false};
@@ -719,7 +722,7 @@ private:
       }
 
       auto joint_names = get_parameter("joint_names").as_string_array();
-      std::vector<double> target_joints(target, target + 6);
+      std::vector<double> target_joints(target, target + 5);
       move_group.setJointValueTarget(joint_names, target_joints);
 
       moveit::planning_interface::MoveGroupInterface::Plan plan;
@@ -799,12 +802,12 @@ private:
   const moveit::core::JointModelGroup*             jmg_{nullptr};
   const moveit::core::LinkModel*                   jacobian_link_{nullptr};
   std::mutex                                       robot_state_mutex_;
-  double                                           current_joint_pos_[6]{};
+  double                                           current_joint_pos_[5]{};
   std::atomic<bool>                                robot_state_ready_{false};
   bool                                             jacobian_ready_{false};
 
   struct JointLimitInfo { bool has_limits; double lower; double upper; };
-  JointLimitInfo joint_limits_[6]{};
+  JointLimitInfo joint_limits_[5]{};
   static constexpr double LIMIT_MARGIN_RAD = 1.0 * M_PI / 180.0;
 };
 

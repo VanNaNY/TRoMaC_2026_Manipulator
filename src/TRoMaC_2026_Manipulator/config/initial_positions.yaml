@@ -2,7 +2,6 @@
 
 initial_positions:
   1-joint: 0
-  2-joint: 0
   3-joint: 1.5708
   4-joint: 1.5447
   5-joint: -1.5936

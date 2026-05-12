@@ -15,13 +15,6 @@ joint_limits:
     max_acceleration: 1.5
     has_jerk_limits: true
     max_jerk: 15.0
-  2-joint:
-    has_velocity_limits: true
-    max_velocity: 1.5
-    has_acceleration_limits: true
-    max_acceleration: 1.5
-    has_jerk_limits: true
-    max_jerk: 15.0
   3-joint:
     has_velocity_limits: true
     max_velocity: 1.5

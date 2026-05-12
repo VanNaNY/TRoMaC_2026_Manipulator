@@ -14,7 +14,6 @@ manipulator_controller:
   ros__parameters:
     joints:
       - 1-joint
-      - 2-joint
       - 3-joint
       - 4-joint
       - 5-joint
