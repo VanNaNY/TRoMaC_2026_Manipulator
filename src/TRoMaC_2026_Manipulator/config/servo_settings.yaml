@@ -9,7 +9,7 @@ scale:
   joint: 1.50 # 关节速度(也就是JointJog的速度缩放)
 
 ## Outgoing command properties
-publish_period: 0.01 # 发布关节轨迹周期，单位秒。
+publish_period: 0.005 # 发布关节轨迹周期，单位秒。
 low_latency_mode: true # 一有有效指令就尽快更新输出。
 command_out_type: trajectory_msgs/JointTrajectory # Servo 下游对接 JointTrajectory控制器。
 publish_joint_positions: true # 发布的轨迹点需不需要带上关节角

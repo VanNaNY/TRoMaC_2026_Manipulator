@@ -28,7 +28,7 @@ static constexpr char START_SERVO_SERVICE[] = "/servo_node/start_servo";
 enum class ControlMode : int { CARTESIAN = 0, JOINT_GROUP_1 = 1, JOINT_GROUP_2 = 2, HOMING = 3, 
                                GETENERGY_1 = 4, GETENERGY_2 = 5, GETENERGY_3 = 6};
 
-// 关节遥控分组（2-joint 锁死后不在列表中）
+// 关节遥控分组（机械臂严重超高，所以把大pitch放平锁死，因此joint-2不在列表中）
 // GROUP_1: yaw + 第一个可控 pitch + 第一个 roll；GROUP_2: 末端两关节
 static const std::vector<std::string> JOINT_GROUP_1_NAMES = {
     "1-joint", "3-joint", "4-joint"};
@@ -331,7 +331,7 @@ private:
 
       // 2-joint 锁死后，planning group active joints = [1-joint, 3-joint, 4-joint, 5-joint, 6-joint]
       // q_dot 索引：[0]=1-joint(yaw 直接遥控), [1]=3-joint(由 Jacobian 解算 XZ), [2]=4-joint(roll), [3]=5-joint(pitch), [4]=6-joint
-      double q_dot[5] = {vy, 0.0, v_roll, v_pitch, 0.0};
+      double q_dot[5] = {vy, 0.0, v_roll, -v_pitch, 0.0};
 
       if (jacobian_ready_ && robot_state_ready_.load() &&
           (vx != 0.0 || vz != 0.0))
@@ -487,18 +487,18 @@ private:
   // 零点偏移（与 tromac_hardware_interface.cpp::JOINT_OFFSET_RAD 保持一致）
   // ros_rad = raw_deg · π/180 + JOINT_OFFSET_RAD  
   static constexpr double joint_offset_rad_[5] = {
-    0.0, 2.9974, -1.09677778, -1.600, 1.8708
+    0.0, 0.7274, 0, 2.4, 1.8708 
   };
 
   // 一键动作目标 (顺序: 1-joint, 3-joint, 4-joint, 5-joint, 6-joint)
   // TODO: 2-joint 锁 0 后，原有四组预设值的末端落点都已偏离，
   //       需在 RViz 实测后重新标定。下面保留的是把原 2-joint 项删除后的"占位"值，
-  //       不保证可达 / 不保证达到原目标位姿。
+  //       不保证可达 / 不保证达到原目标位姿。   95.47 -112.20 -73.65 20.35 8.44  94.53 -113.77 -72.67 18.61 9.30
   static constexpr double home_target_rad_[5] = {
-    -1.680,
-     2.75654456,
-    -1.68896800,
-    -1.19665441,
+    -1.666,
+     2.68565942,
+    -1.285470,
+     -2.04445,
      2.01706
   };
 

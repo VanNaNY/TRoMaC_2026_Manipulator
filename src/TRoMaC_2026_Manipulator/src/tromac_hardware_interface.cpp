@@ -1,9 +1,3 @@
-// TRoMaC Hardware Interface — ros2_control SystemInterface 插件
-// 通过串口与下位机通信：
-//   read()  : 从 RX 帧读取 Real_Joint_1~6（下位机度数）→ 转 ROS 弧度 → state position
-//             同时把摇杆数据发布到 /serial_recv topic
-//   write() : command position（ROS 弧度）→ 减零位偏移 → 转下位机度数 → 串口 TX
-
 #include <hardware_interface/system_interface.hpp>
 #include <hardware_interface/handle.hpp>
 #include <hardware_interface/hardware_info.hpp>
@@ -42,15 +36,15 @@ namespace tromac_hardware
     // ros_rad = JOINT_DIR * raw_deg * π/180 + JOINT_OFFSET_RAD
     static constexpr double JOINT_OFFSET_RAD[5] = {
         0.0,         // 1-joint
-        2.9974,      // 3-joint
-        -1.09677778, // 4-joint
-        -1.600,      // 5-joint
+        0.7274,      // 3-joint
+        0, // 4-joint
+        2.4,      // 5-joint
         1.8708       // 6-joint
     };
 
     // 下位机 ↔ ROS 关节旋转方向系数
     static constexpr double JOINT_DIR[5] = {
-        -1.0, -1.0, -1.0, 1.0, 1.0};
+        -1.0, -1.0, -1.0, -1.0, 1.0};
 
     // 串口收发使用 int16_t，但单位为 0.01° (定点)，避免整数度量化导致 MCU 死区
     // 量程 ±327.67°，关节角不会越界
