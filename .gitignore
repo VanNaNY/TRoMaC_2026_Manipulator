@@ -30,3 +30,7 @@ node_modules/
 *.swp
 *~
 .DS_Store
+
+# AI 助手本地配置（仅本地保留，不纳入版本库）
+.cursor/rules/
+src/TRoMaC_2026_Manipulator/.claude/skills/
